@@ -16,7 +16,7 @@ import hashlib
 import logging
 from datetime import date, datetime
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple
 
 import os
 
@@ -104,6 +104,12 @@ class Player:
     triple_rate: float       # 3連対率
     recent_results: str      # 直近成績（例: "1-3-2-1-5"）
     gear: str                # ギア倍数
+    back_count: int = 0      # B本数
+    escape_count: int = 0    # 逃げ回数
+    makuri_count: int = 0    # 捲り回数
+    sashi_count: int = 0     # 差し回数
+    mark_count: int = 0      # マーク回数
+    line_role: str = "不明"   # 先頭/番手/短期/不明
 
 
 @dataclass
@@ -116,6 +122,8 @@ class RaceInfo:
     players: List[Player] = field(default_factory=list)
     source_url: str = ""
     is_mock: bool = False    # スクレイプ失敗時のモックデータフラグ
+    odds_map: Dict[str, Dict[Tuple[int, int, int], float]] = field(default_factory=dict)
+    odds_fetched_at: Optional[datetime] = None
 
 
 # ─── スクレイパー ─────────────────────────────────────────────────────────────
@@ -143,6 +151,184 @@ def _safe_int(val, default=0) -> int:
         return int(str(val).strip())
     except (ValueError, TypeError):
         return default
+
+
+def _normalize_ticket_type(text: str) -> Optional[str]:
+    compact = re.sub(r"\s+", "", text)
+    if "三連単" in compact or "3連単" in compact:
+        return "三連単"
+    if "三連複" in compact or "3連複" in compact:
+        return "三連複"
+    return None
+
+
+def _extract_combo_from_text(text: str) -> Optional[Tuple[int, int, int]]:
+    m = re.search(r"([1-9])\s*(?:[-=→＞>])\s*([1-9])\s*(?:[-=→＞>])\s*([1-9])", text)
+    if not m:
+        return None
+    return int(m.group(1)), int(m.group(2)), int(m.group(3))
+
+
+def _extract_odds_value(text: str) -> Optional[float]:
+    # 例: "12.5倍", "1,240.0倍", "999倍"
+    m = re.search(r"(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*倍", text)
+    if not m:
+        return None
+    return _safe_float(m.group(1).replace(",", ""), default=None)
+
+
+def _extract_odds_from_odds_contents(
+    soup: BeautifulSoup, ticket_type: str
+) -> Dict[Tuple[int, int, int], float]:
+    """
+    オッズ領域（JS_ODDSCONTENTS_xxx）の「人気順/高配当順」テキストから抽出。
+    Kドリームスでは「7-5-1 12.4」「1=5=7 5.1」のような形式で並ぶ。
+    """
+    block_id = "JS_ODDSCONTENTS_3rentan" if ticket_type == "三連単" else "JS_ODDSCONTENTS_3renhuku"
+    block = soup.find(id=block_id)
+    if block is None:
+        return {}
+
+    text = block.get_text(" ", strip=True)
+    result: Dict[Tuple[int, int, int], float] = {}
+
+    if ticket_type == "三連単":
+        pattern = re.compile(r"([1-9])\s*[-→＞>]\s*([1-9])\s*[-→＞>]\s*([1-9])\s+(\d{1,4}(?:\.\d+)?)")
+    else:
+        pattern = re.compile(r"([1-9])\s*[=＝]\s*([1-9])\s*[=＝]\s*([1-9])\s+(\d{1,4}(?:\.\d+)?)")
+
+    for m in pattern.finditer(text):
+        combo = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        odds = _safe_float(m.group(4), default=None)
+        if odds is None:
+            continue
+
+        key = combo if ticket_type == "三連単" else tuple(sorted(combo))
+        # 同一組番が複数回出る（人気順/高配当順）ため、低い方を採用。
+        if key not in result or odds < result[key]:
+            result[key] = odds
+
+    return result
+
+
+def _extract_odds_map(soup: BeautifulSoup) -> Dict[str, Dict[Tuple[int, int, int], float]]:
+    """
+    三連単/三連複オッズを抽出して返す。
+    戻り値:
+      {
+        "三連単": {(1, 2, 3): 12.5, ...},
+        "三連複": {(1, 2, 3): 5.2, ...},
+      }
+    """
+    odds_map: Dict[str, Dict[Tuple[int, int, int], float]] = {"三連単": {}, "三連複": {}}
+
+    # まず専用オッズ領域から抽出（最優先）。
+    for ticket_type in ("三連単", "三連複"):
+        odds_map[ticket_type].update(_extract_odds_from_odds_contents(soup, ticket_type))
+
+    # テーブル主体で抽出。票種は table 前後テキストまたは table 内ヘッダから推定。
+    for table in soup.find_all("table"):
+        table_text = table.get_text(" ", strip=True)
+        ticket_type = _normalize_ticket_type(table_text)
+        if ticket_type is None:
+            # 直前の見出しテキストも見る
+            prev_text = ""
+            prev = table.find_previous(["h1", "h2", "h3", "h4", "h5", "p", "div"])
+            if prev is not None:
+                prev_text = prev.get_text(" ", strip=True)
+            ticket_type = _normalize_ticket_type(prev_text)
+        if ticket_type is None:
+            continue
+
+        for row in table.find_all("tr"):
+            row_text = row.get_text(" ", strip=True)
+            combo = _extract_combo_from_text(row_text)
+            odds = _extract_odds_value(row_text)
+            if combo is None or odds is None:
+                continue
+
+            key = combo if ticket_type == "三連単" else tuple(sorted(combo))
+            odds_map[ticket_type][key] = odds
+
+    # script埋め込みのテキストにも一部オッズが含まれる場合があるため補完抽出
+    for script in soup.find_all("script"):
+        text = script.string or script.get_text(" ", strip=True)
+        if not text:
+            continue
+        if "odds" not in text.lower() and "オッズ" not in text:
+            continue
+        ticket_type = _normalize_ticket_type(text)
+        if ticket_type is None:
+            continue
+
+        for m in re.finditer(
+            r"([1-9])\s*(?:[-=→＞>])\s*([1-9])\s*(?:[-=→＞>])\s*([1-9]).{0,30}?(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*倍",
+            text,
+        ):
+            combo = (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+            odds = _safe_float(m.group(4).replace(",", ""), default=None)
+            if odds is None:
+                continue
+            key = combo if ticket_type == "三連単" else tuple(sorted(combo))
+            odds_map[ticket_type][key] = odds
+
+    return {k: v for k, v in odds_map.items() if v}
+
+
+def _infer_line_role_from_comment(comment: str) -> str:
+    c = (comment or "").strip()
+    if not c:
+        return "不明"
+    if "単騎" in c:
+        return "短期"
+    if "自力" in c or "前で" in c:
+        return "先頭"
+    if "君" in c or "さん" in c:
+        return "番手"
+    return "不明"
+
+
+def _parse_line_roles(soup: BeautifulSoup) -> Dict[int, str]:
+    """
+    選手コメント欄から先頭/番手/短期を推定して返す。
+    {car_number: role}
+    """
+    roles: Dict[int, str] = {}
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        if not rows:
+            continue
+        header_text = rows[0].get_text(" ", strip=True)
+        if "選手コメント" not in header_text:
+            continue
+
+        for row in rows[1:]:
+            texts = [c.get_text(" ", strip=True) for c in row.find_all(["td", "th"])]
+            if len(texts) < 10:
+                continue
+
+            # 形式A: [..., 枠番, 車番, 選手名, ...]（len>=15）
+            # 形式B: [..., 枠番, 車番, 選手名, ...]（末尾側の空セルが省略され len=14）
+            car_number = None
+            candidates = []
+            if len(texts) > 4:
+                candidates.append(texts[4])
+            if len(texts) > 3:
+                candidates.append(texts[3])
+            for c in candidates:
+                n = _safe_int(c, default=-1)
+                if 1 <= n <= 9:
+                    car_number = n
+                    break
+            if car_number is None:
+                continue
+
+            comment = next((t for t in texts if "。" in t and len(t) <= 20), "")
+            role = _infer_line_role_from_comment(comment)
+            roles[car_number] = role
+        break
+
+    return roles
 
 
 def fetch_race_list_for_date(target_date: date) -> List[dict]:
@@ -238,6 +424,8 @@ def _scrape_race_card(venue: str, race_number: int, target_date: date, url: str)
         soup = BeautifulSoup(res.content, "html.parser")
 
         players = _parse_players(soup)
+        odds_map = _extract_odds_map(soup)
+        odds_fetched_at = datetime.now()
         if not players:
             logger.warning(f"選手データ取得失敗 ({url}) → モックデータ使用")
             if _allow_mock():
@@ -255,6 +443,8 @@ def _scrape_race_card(venue: str, race_number: int, target_date: date, url: str)
             players=players,
             source_url=url,
             is_mock=False,
+            odds_map=odds_map,
+            odds_fetched_at=odds_fetched_at,
         )
 
     except Exception as e:
@@ -272,6 +462,7 @@ def _allow_mock() -> bool:
 def _parse_players(soup: BeautifulSoup) -> List[Player]:
     """BeautifulSoup から選手情報をパース"""
     players = []
+    line_roles = _parse_line_roles(soup)
 
     # Kドリームスの出走表テーブルを探す
     table = soup.find("table", class_=re.compile(r"race.*card|racecard|entry", re.IGNORECASE))
@@ -340,6 +531,12 @@ def _parse_players(soup: BeautifulSoup) -> List[Player]:
             win_rate = _safe_float(texts[-3], default=0.0) if len(texts) >= 3 else 0.0
             d_rate = _safe_float(texts[-2], default=0.0) if len(texts) >= 2 else 0.0
             t_rate = _safe_float(texts[-1], default=0.0) if len(texts) >= 1 else 0.0
+            s_count = _safe_int(texts[10], default=0) if len(texts) > 10 else 0
+            b_count = _safe_int(texts[11], default=0) if len(texts) > 11 else 0
+            nige_count = _safe_int(texts[12], default=0) if len(texts) > 12 else 0
+            makuri_count = _safe_int(texts[13], default=0) if len(texts) > 13 else 0
+            sashi_count = _safe_int(texts[14], default=0) if len(texts) > 14 else 0
+            mark_count = _safe_int(texts[15], default=0) if len(texts) > 15 else 0
 
             players.append(Player(
                 car_number=car_num,
@@ -354,6 +551,12 @@ def _parse_players(soup: BeautifulSoup) -> List[Player]:
                 triple_rate=t_rate / 100 if t_rate > 1 else t_rate,
                 recent_results="",
                 gear=gear,
+                back_count=b_count if b_count >= 0 else max(0, s_count),
+                escape_count=nige_count,
+                makuri_count=makuri_count,
+                sashi_count=sashi_count,
+                mark_count=mark_count,
+                line_role=line_roles.get(car_num, "不明"),
             ))
             continue
 
@@ -397,6 +600,7 @@ def _parse_players(soup: BeautifulSoup) -> List[Player]:
                 triple_rate=t_rate,
                 recent_results=recent,
                 gear=gear,
+                line_role=line_roles.get(car_num, "不明"),
             ))
         except Exception as e:
             logger.debug(f"選手行パースエラー: {e} - {texts}")
@@ -452,4 +656,6 @@ def _make_mock_race(venue: str, race_number: int, race_date: date) -> RaceInfo:
         players=players,
         source_url="",
         is_mock=True,
+        odds_map={},
+        odds_fetched_at=None,
     )

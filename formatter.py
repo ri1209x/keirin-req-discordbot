@@ -7,6 +7,7 @@ from recommender import RaceRecommendation, STRATEGIES, TICKET_TYPES
 STRATEGY_COLORS = {"本命": 0x3498DB, "中穴": 0xE67E22, "大穴": 0xE74C3C}
 STRATEGY_EMOJIS = {"本命": "🔵", "中穴": "🟠", "大穴": "🔴"}
 STAR_EMOJIS = {3: "⭐⭐⭐", 2: "⭐⭐", 1: "⭐"}
+EMBED_FIELD_LIMIT = 1024
 
 
 def format_numbers(numbers: list, ticket_type: str) -> str:
@@ -70,11 +71,32 @@ def build_recommendation_embed(rec: RaceRecommendation, ai_advice: str = None) -
     for i, bet in enumerate(rec.bets):
         stars = STAR_EMOJIS.get(bet.stars, "⭐")
         nums = format_numbers(bet.numbers, rec.ticket_type)
-        bet_lines.append(f"`{i+1:2d}.` {stars} **{nums}**　{bet.amount:,}円")
+        odds_suffix = f"（現在オッズ: {bet.current_odds:.1f}倍）" if bet.current_odds is not None else ""
+        bet_lines.append(f"`{i+1:2d}.` {stars} **{nums}**　{bet.amount:,}円 {odds_suffix}".rstrip())
+
+    # Discord Embed field value は最大1024文字
+    if bet_lines:
+        visible_lines = []
+        for line in bet_lines:
+            trial = "\n".join(visible_lines + [line])
+            if len(trial) > EMBED_FIELD_LIMIT - 32:
+                break
+            visible_lines.append(line)
+        omitted = len(bet_lines) - len(visible_lines)
+        if omitted > 0:
+            summary = f"... 他 {omitted}点"
+            trial = "\n".join(visible_lines + [summary])
+            if len(trial) <= EMBED_FIELD_LIMIT:
+                visible_lines.append(summary)
+            elif visible_lines:
+                visible_lines[-1] = summary
+        bet_value = "\n".join(visible_lines) if visible_lines else "買い目なし"
+    else:
+        bet_value = "買い目なし"
 
     embed.add_field(
         name="🎯 推奨買い目",
-        value="\n".join(bet_lines) if bet_lines else "買い目なし",
+        value=bet_value,
         inline=False
     )
 
@@ -102,6 +124,14 @@ def build_recommendation_embed(rec: RaceRecommendation, ai_advice: str = None) -
         data_note = "⚠️ 本日の出走表が取得できなかったため模擬データを使用しています"
     else:
         data_note = f"✅ Kドリームス出走表データを使用"
+    if rec.odds_fetched_at:
+        data_note += f"\n🕒 オッズ取得時刻: {rec.odds_fetched_at}"
+    else:
+        data_note += "\n🕒 オッズ取得時刻: 取得できませんでした"
+    data_note += (
+        f"\n📈 {rec.ticket_type}オッズ取得件数: {rec.ticket_odds_count}件"
+        f"\n✅ 推奨買い目との一致: {rec.matched_odds_count}/{len(rec.bets)}点"
+    )
     embed.add_field(name="📊 データソース", value=data_note, inline=False)
 
     embed.set_footer(
@@ -141,7 +171,7 @@ def build_help_embed() -> discord.Embed:
         name="🎯 戦略の違い",
         value=(
             "🔵 **本命** - 上位3選手中心。3点買い。的中率重視\n"
-            "🟠 **中穴** - バランス型。5点買い。10〜30倍狙い\n"
+            "🟠 **中穴** - バランス型。10点買い。10〜30位人気帯狙い\n"
             "🔴 **大穴** - 高配当狙い。8点買い。荒れたレースに強い"
         ),
         inline=False
@@ -150,6 +180,7 @@ def build_help_embed() -> discord.Embed:
         name="⚙️ データ取得について",
         value=(
             "楽天Kドリームス（keirin.kdreams.jp）から当日の出走表を取得します。\n"
+            " `/keirin` 実行時点のオッズを取得して表示します。\n"
             "レースが開催されていない場合や取得失敗時は模擬データを使用します。"
         ),
         inline=False

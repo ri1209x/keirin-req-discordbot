@@ -3,33 +3,49 @@
 実際の出走表データ（スクレイプ or モック）＋戦略ロジックで買い目を生成
 """
 from dataclasses import dataclass
-from typing import List
+from typing import Dict, List, Optional, Tuple
 
-from scraper import RaceInfo, Player, VENUES
+from scraper import RaceInfo, Player
 
 # ─── 定数 ────────────────────────────────────────────────────────────────────
 
 STRATEGIES = {
     "本命": {
-        "description": "1〜3番人気の選手を中心に堅い組み合わせ",
-        "num_bets": 3,
+        "description": "オッズと出走表指標を重み付けし、堅めの組み合わせを優先",
+        "min_bets": 2,
+        "max_bets": 8,
         "top_n": 3,
         "confidence": "高",
-        "expected_odds": "2〜5倍",
+        "expected_odds": "3〜10倍",
+        "rank_range": (1, 5),
+        "odds_range": (3.0, 10.0),
+        "target_portfolio_odds": (3.0, 10.0),
+        # 直近過去レースの簡易バックテストで調整（odds偏重を少し緩め、戦法を増やす）
+        "weights": {"odds": 0.40, "form": 0.30, "line": 0.15, "tactic": 0.15},
     },
     "中穴": {
-        "description": "2〜5番人気を絡めたバランス型",
-        "num_bets": 5,
+        "description": "オッズ帯と選手能力のバランスで中穴帯を狙う",
+        "min_bets": 5,
+        "max_bets": 18,
         "top_n": 5,
         "confidence": "中",
-        "expected_odds": "10〜30倍",
+        "expected_odds": "20〜50倍",
+        "rank_range": (6, 40),
+        "odds_range": (20.0, 50.0),
+        "target_portfolio_odds": (20.0, 50.0),
+        "weights": {"odds": 0.40, "form": 0.30, "line": 0.15, "tactic": 0.15},
     },
     "大穴": {
-        "description": "高配当狙い。下位人気選手を積極的に絡める",
-        "num_bets": 8,
+        "description": "高配当帯の中で展開要素を重視して選抜",
+        "min_bets": 7,
+        "max_bets": 100,
         "top_n": 9,
         "confidence": "低",
-        "expected_odds": "50〜500倍",
+        "expected_odds": "100〜300倍",
+        "rank_range": (41, 120),
+        "odds_range": (100.0, 300.0),
+        "target_portfolio_odds": (100.0, 300.0),
+        "weights": {"odds": 0.38, "form": 0.22, "line": 0.20, "tactic": 0.20},
     },
 }
 
@@ -45,6 +61,7 @@ class BetRecommendation:
     amount: int
     stars: int
     reason: str
+    current_odds: Optional[float] = None
 
 
 @dataclass
@@ -59,6 +76,9 @@ class RaceRecommendation:
     total_amount: int
     is_mock: bool
     source_url: str
+    odds_fetched_at: Optional[str]
+    ticket_odds_count: int
+    matched_odds_count: int
 
 
 def _rank_players(players: List[Player], strategy: str) -> List[Player]:
@@ -110,6 +130,561 @@ def _generate_combinations(ranked, strategy, ticket_type, num_bets):
     return combos[:num_bets]
 
 
+def _calc_weighted_avg_odds(odds_list: List[float], amounts: List[int]) -> Optional[float]:
+    usable = [(od, am) for od, am in zip(odds_list, amounts) if od is not None]
+    if not usable:
+        return None
+    total_amount = sum(am for _, am in usable)
+    if total_amount <= 0:
+        return None
+    return sum(od * am for od, am in usable) / total_amount
+
+
+def _safe_norm(val: float, min_v: float, max_v: float) -> float:
+    if max_v <= min_v:
+        return 0.5
+    return max(0.0, min(1.0, (val - min_v) / (max_v - min_v)))
+
+
+def _distance_to_range(value: float, low: float, high: float) -> float:
+    if low <= value <= high:
+        return 0.0
+    if value < low:
+        return low - value
+    return value - high
+
+
+def _sorted_odds_items(race_info: RaceInfo, ticket_type: str):
+    odds_map = race_info.odds_map.get(ticket_type, {})
+    items = sorted(odds_map.items(), key=lambda x: (x[1], x[0]))
+    return [
+        {
+            "numbers": list(combo),
+            "odds": odds,
+            "rank": idx + 1,
+        }
+        for idx, (combo, odds) in enumerate(items)
+    ]
+
+
+def _build_player_feature_map(players: List[Player]) -> Dict[int, Dict[str, float]]:
+    if not players:
+        return {}
+
+    score_min, score_max = min(p.score for p in players), max(p.score for p in players)
+    win_min, win_max = min(p.win_rate for p in players), max(p.win_rate for p in players)
+    tri_min, tri_max = min(p.triple_rate for p in players), max(p.triple_rate for p in players)
+    back_min, back_max = min(p.back_count for p in players), max(p.back_count for p in players)
+
+    role_value = {"先頭": 1.0, "番手": 0.85, "短期": 0.70, "不明": 0.55}
+    style_value = {"逃": 1.0, "両": 0.85, "追": 0.70}
+
+    feature_map: Dict[int, Dict[str, float]] = {}
+    for p in players:
+        attack_count = p.escape_count + p.makuri_count
+        finish_count = p.sashi_count + p.mark_count
+        move_total = attack_count + finish_count
+        attack_ratio = (attack_count / move_total) if move_total > 0 else (0.55 if p.style in ("逃", "両") else 0.35)
+        finish_ratio = (finish_count / move_total) if move_total > 0 else (0.45 if p.style in ("追", "両") else 0.35)
+
+        form_score = (
+            _safe_norm(p.score, score_min, score_max) * 0.40
+            + _safe_norm(p.win_rate, win_min, win_max) * 0.20
+            + _safe_norm(p.triple_rate, tri_min, tri_max) * 0.25
+            + _safe_norm(float(p.back_count), float(back_min), float(back_max)) * 0.15
+        )
+
+        tactic_score = (
+            attack_ratio * 0.50
+            + finish_ratio * 0.35
+            + style_value.get(p.style, 0.60) * 0.15
+        )
+
+        feature_map[p.car_number] = {
+            "form": form_score,
+            "tactic": tactic_score,
+            "role": role_value.get(p.line_role, role_value["不明"]),
+            "attack_ratio": attack_ratio,
+            "finish_ratio": finish_ratio,
+            "line_role": p.line_role,
+        }
+
+    return feature_map
+
+
+def _calc_line_component(combo: List[int], ticket_type: str, feature_map: Dict[int, Dict[str, float]]) -> float:
+    roles = [feature_map.get(n, {}).get("line_role", "不明") for n in combo]
+
+    if ticket_type == "三連単":
+        first = roles[0] if len(roles) > 0 else "不明"
+        second = roles[1] if len(roles) > 1 else "不明"
+        base = 0.45
+        if first == "先頭":
+            base += 0.25
+        if second == "番手":
+            base += 0.20
+        if "短期" in roles:
+            base += 0.10
+        return min(1.0, base)
+
+    # 三連複は並び順がないため、先頭/番手の同居を評価
+    has_lead = "先頭" in roles
+    has_follow = "番手" in roles
+    has_short = "短期" in roles
+    score = 0.45 + (0.25 if has_lead and has_follow else 0.0) + (0.10 if has_short else 0.0)
+    return min(1.0, score)
+
+
+def _calc_tactic_component(combo: List[int], ticket_type: str, feature_map: Dict[int, Dict[str, float]]) -> float:
+    f = [feature_map.get(n, {}) for n in combo]
+    if not f:
+        return 0.5
+
+    if ticket_type == "三連単":
+        first_attack = f[0].get("attack_ratio", 0.5) if len(f) > 0 else 0.5
+        second_finish = f[1].get("finish_ratio", 0.5) if len(f) > 1 else 0.5
+        mean_tactic = sum(x.get("tactic", 0.5) for x in f) / len(f)
+        return min(1.0, first_attack * 0.45 + second_finish * 0.30 + mean_tactic * 0.25)
+
+    return min(1.0, sum(x.get("tactic", 0.5) for x in f) / len(f))
+
+
+def _calc_odds_component(odds: float, rank: int, strategy: str) -> float:
+    cfg = STRATEGIES[strategy]
+    low, high = cfg["target_portfolio_odds"]
+    rank_min, rank_max = cfg["rank_range"]
+    center = (low + high) / 2
+    spread = max((high - low) / 2, 1.0)
+    odds_closeness = max(0.0, 1.0 - abs(odds - center) / (spread * 3.0))
+
+    if rank_max <= rank_min:
+        rank_fit = 0.5
+    elif rank < rank_min:
+        rank_fit = max(0.0, 1.0 - (rank_min - rank) / max(rank_min, 1))
+    elif rank > rank_max:
+        rank_fit = max(0.0, 1.0 - (rank - rank_max) / max(rank_max, 1))
+    else:
+        rank_fit = 1.0
+
+    return odds_closeness * 0.65 + rank_fit * 0.35
+
+
+def _calc_combo_score(
+    combo: List[int],
+    odds: float,
+    rank: int,
+    strategy: str,
+    ticket_type: str,
+    feature_map: Dict[int, Dict[str, float]],
+) -> float:
+    weights = STRATEGIES[strategy]["weights"]
+    player_features = [feature_map.get(n, {"form": 0.5}) for n in combo]
+    form_component = sum(f.get("form", 0.5) for f in player_features) / len(player_features) if player_features else 0.5
+    line_component = _calc_line_component(combo, ticket_type, feature_map)
+    tactic_component = _calc_tactic_component(combo, ticket_type, feature_map)
+    odds_component = _calc_odds_component(odds, rank, strategy)
+    return (
+        odds_component * weights["odds"]
+        + form_component * weights["form"]
+        + line_component * weights["line"]
+        + tactic_component * weights["tactic"]
+    )
+
+
+def _get_budget_target_count(strategy: str, budget: int, min_bets: int, max_bets: int) -> int:
+    if strategy == "本命":
+        base = max(2, budget // 500)
+    elif strategy == "中穴":
+        if budget <= 1000:
+            base = 7
+        elif budget <= 1500:
+            base = 10
+        elif budget <= 2000:
+            base = 13
+        else:
+            base = max(10, budget // 180)
+    else:
+        # 大穴は低予算帯では100円刻みで広く買う方針
+        if budget <= 10000:
+            base = max(7, budget // 100)
+        else:
+            base = max(7, budget // 150)
+    return max(min_bets, min(max_bets, base))
+
+
+def _get_middle_count_window(budget: int) -> Tuple[int, int]:
+    if budget <= 1000:
+        return 6, 8
+    if budget <= 1500:
+        return 9, 12
+    if budget <= 2000:
+        return 12, 15
+    return 10, 18
+
+
+def _calc_diversity_score(selected: List[dict], ticket_type: str) -> float:
+    if not selected:
+        return 0.0
+    combos = [s["numbers"] for s in selected]
+    unique_numbers = len({n for c in combos for n in c})
+    number_div = unique_numbers / 9.0
+
+    if ticket_type == "三連単":
+        first_div = len({c[0] for c in combos}) / max(1, min(9, len(combos)))
+    else:
+        first_div = len({min(c) for c in combos}) / max(1, min(9, len(combos)))
+
+    overlap_vals = []
+    for i in range(len(combos)):
+        a = set(combos[i])
+        for j in range(i + 1, len(combos)):
+            b = set(combos[j])
+            overlap_vals.append(len(a & b) / 3.0)
+    overlap = (sum(overlap_vals) / len(overlap_vals)) if overlap_vals else 0.0
+    overlap_score = 1.0 - overlap
+    return number_div * 0.40 + first_div * 0.30 + overlap_score * 0.30
+
+
+def _estimate_race_chaos(players: List[Player]) -> bool:
+    """
+    荒れやすさを簡易判定。
+    - 先頭役が多い
+    - バック本数が全体的に多い
+    - 上位の3連対率差が小さい（混戦）
+    """
+    if not players:
+        return False
+    lead_cnt = sum(1 for p in players if p.line_role == "先頭")
+    avg_back = sum(p.back_count for p in players) / max(1, len(players))
+    tri_rates = sorted((p.triple_rate for p in players), reverse=True)
+    top_spread = (tri_rates[0] - tri_rates[min(2, len(tri_rates) - 1)]) if tri_rates else 1.0
+    chaos_score = 0.0
+    chaos_score += 1.0 if lead_cnt >= 3 else 0.0
+    chaos_score += 1.0 if avg_back >= 2.0 else 0.0
+    chaos_score += 1.0 if top_spread <= 0.12 else 0.0
+    return chaos_score >= 2.0
+
+
+def _filter_candidates_by_strategy(
+    scored: List[dict],
+    strategy: str,
+    required_count: int = 0,
+    allow_high_odds_extension: bool = False,
+) -> List[dict]:
+    cfg = STRATEGIES[strategy]
+    rank_min, rank_max = cfg.get("rank_range", (1, 10**9))
+    odds_min, odds_max = cfg.get("odds_range", (0.0, float("inf")))
+    odds_center = (odds_min + odds_max) / 2.0
+
+    if strategy == "大穴":
+        # 大穴でも 500倍超は常時除外
+        capped = [x for x in scored if x["odds"] <= 500.0]
+        strict = [
+            x for x in capped
+            if rank_min <= x["rank"] <= rank_max and odds_min <= x["odds"] <= odds_max
+        ]
+        if required_count <= 0:
+            required_count = len(strict)
+
+        # 基本は 100〜300 倍で構成
+        result = strict[:]
+
+        # 荒れる判定時のみ 300〜500 倍を最大2点まで補充
+        if allow_high_odds_extension and len(result) < required_count:
+            ext = [
+                x for x in capped
+                if rank_min <= x["rank"] <= rank_max and 300.0 < x["odds"] <= 500.0
+            ]
+            ext.sort(key=lambda x: (abs(x["odds"] - 400.0), x["rank"]))
+            extra_limit = min(2, required_count - len(result))
+            for x in ext[:extra_limit]:
+                if x not in result:
+                    result.append(x)
+
+        # なお不足する場合は rank帯内で 500倍以下を近傍順に補完
+        if len(result) < required_count:
+            rank_pool = [x for x in capped if rank_min <= x["rank"] <= rank_max and x not in result]
+            rank_pool.sort(key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
+            for x in rank_pool:
+                result.append(x)
+                if len(result) >= required_count:
+                    break
+
+        if result:
+            return result
+
+    strict = [
+        x for x in scored
+        if rank_min <= x["rank"] <= rank_max and odds_min <= x["odds"] <= odds_max
+    ]
+    if strict and (required_count <= 0 or len(strict) >= required_count):
+        return strict
+
+    rank_only = [x for x in scored if rank_min <= x["rank"] <= rank_max]
+    if rank_only:
+        if not strict:
+            if required_count <= 0:
+                return rank_only
+            # 目標オッズに近い順で必要件数まで採用
+            ranked = sorted(rank_only, key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
+            return ranked[:required_count]
+
+        # strictが不足する場合はrank帯からオッズ近傍を補完
+        remain = [x for x in rank_only if x not in strict]
+        remain.sort(key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
+        merged = strict[:]
+        for x in remain:
+            if x in merged:
+                continue
+            merged.append(x)
+            if required_count > 0 and len(merged) >= required_count:
+                break
+        return merged
+
+    if strict:
+        # rank帯が取れないが strict はあるケース
+        return strict
+
+    odds_only = [x for x in scored if odds_min <= x["odds"] <= odds_max]
+    if odds_only:
+        if required_count <= 0:
+            return odds_only
+        ranked = sorted(odds_only, key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
+        return ranked[:required_count]
+
+    if required_count > 0:
+        return scored[:required_count]
+
+    return scored
+
+
+def _select_combos_from_odds(
+    race_info: RaceInfo,
+    strategy: str,
+    ticket_type: str,
+    budget: int,
+) -> List[List[int]]:
+    config = STRATEGIES[strategy]
+    ranked_odds = _sorted_odds_items(race_info, ticket_type)
+    candidates = ranked_odds[:]
+    if not candidates:
+        return []
+
+    feature_map = _build_player_feature_map(race_info.players)
+    scored = []
+    for item in candidates:
+        combo = item["numbers"]
+        score = _calc_combo_score(
+            combo=combo,
+            odds=item["odds"],
+            rank=item["rank"],
+            strategy=strategy,
+            ticket_type=ticket_type,
+            feature_map=feature_map,
+        )
+        scored.append({**item, "score": score})
+
+    scored.sort(key=lambda x: (-x["score"], x["rank"], x["odds"]))
+    affordable = max(1, budget // 100)
+    min_bets = min(config.get("min_bets", 2), affordable, len(scored))
+    max_bets = min(config.get("max_bets", 12), affordable, len(scored))
+    if max_bets < min_bets:
+        min_bets = max_bets
+
+    target_low, target_high = config.get("target_portfolio_odds", (3.0, 5.0))
+    target_center = (target_low + target_high) / 2.0
+
+    candidates_packs = []
+    desired_count = _get_budget_target_count(strategy, budget, min_bets, max_bets)
+    required_count = desired_count if strategy in ("中穴", "大穴") else min_bets
+    chaos = _estimate_race_chaos(race_info.players)
+    scoped = _filter_candidates_by_strategy(
+        scored,
+        strategy,
+        required_count=required_count,
+        allow_high_odds_extension=(strategy == "大穴" and chaos),
+    )
+
+    # scoped件数に合わせて点数上限を再計算
+    min_bets = min(min_bets, len(scoped))
+    max_bets = min(max_bets, len(scoped))
+    if max_bets < min_bets:
+        min_bets = max_bets
+    desired_count = min(max(desired_count, min_bets), max_bets)
+    required_count = min(max(required_count, min_bets), max_bets)
+
+    if strategy == "中穴":
+        w_min, w_max = _get_middle_count_window(budget)
+        search_min = max(min_bets, w_min)
+        search_max = min(max_bets, w_max)
+        required_count = max(search_min, min(required_count, search_max))
+    else:
+        search_min = max(min_bets, desired_count - 2)
+        search_max = min(max_bets, desired_count + 2)
+        search_min = max(search_min, required_count)
+
+    for bet_count in range(search_min, search_max + 1):
+        selected = sorted(
+            scoped,
+            key=lambda x: (abs(x["odds"] - target_center), x["rank"], -x["score"])
+        )[:bet_count]
+        amounts = _calc_amounts(budget, len(selected), strategy)
+        remaining = [x for x in scoped if x not in selected]
+        remaining.sort(key=lambda x: x["odds"])
+
+        for _ in range(25):
+            avg_odds = _calc_weighted_avg_odds([x["odds"] for x in selected], amounts)
+            if avg_odds is None:
+                break
+            if target_low <= avg_odds <= target_high:
+                break
+
+            if avg_odds < target_low:
+                selected.sort(key=lambda x: x["odds"])
+                low_item = selected[0]
+                replacement = next((x for x in reversed(remaining) if x["odds"] > low_item["odds"]), None)
+            else:
+                selected.sort(key=lambda x: x["odds"], reverse=True)
+                low_item = selected[0]
+                replacement = next((x for x in remaining if x["odds"] < low_item["odds"]), None)
+
+            if replacement is None:
+                break
+            selected[0] = replacement
+            remaining.remove(replacement)
+            remaining.append(low_item)
+
+        amounts = _calc_amounts(budget, len(selected), strategy)
+        avg_odds = _calc_weighted_avg_odds([x["odds"] for x in selected], amounts)
+        if avg_odds is None:
+            continue
+        range_distance = _distance_to_range(avg_odds, target_low, target_high)
+        center_distance = abs(avg_odds - target_center)
+        # 合成オッズ・点数・分散のバランスで評価
+        quality_bonus = -sum(x["score"] for x in selected) / max(len(selected), 1) * 0.05
+        diversity = _calc_diversity_score(selected, ticket_type)
+
+        if strategy == "本命":
+            count_penalty = abs(bet_count - desired_count) * 0.45
+            diversity_penalty = (1.0 - diversity) * 0.8
+            range_weight = 20
+            center_weight = 2
+        elif strategy == "中穴":
+            count_penalty = abs(bet_count - desired_count) * 0.70
+            diversity_penalty = (1.0 - diversity) * 2.2
+            range_weight = 12
+            center_weight = 1.5
+        else:
+            count_penalty = abs(bet_count - desired_count) * 0.90
+            diversity_penalty = (1.0 - diversity) * 2.8
+            range_weight = 10
+            center_weight = 1.2
+
+        objective = (
+            range_distance * range_weight
+            + center_distance * center_weight
+            + count_penalty
+            + diversity_penalty
+            + quality_bonus
+        )
+        candidates_packs.append(
+            {
+                "objective": objective,
+                "selected": selected[:],
+                "bet_count": bet_count,
+                "avg_odds": avg_odds,
+            }
+        )
+
+    if not candidates_packs:
+        final_selected = scoped[:min_bets]
+    else:
+        chosen = min(candidates_packs, key=lambda p: p["objective"])
+        chosen_drift = _distance_to_range(chosen["avg_odds"], target_low, target_high)
+
+        # 予算寄り探索で合成オッズが大きく外れた場合は、全点数帯から再探索して補正する。
+        if chosen_drift > 1.0:
+            global_packs = []
+            global_min = max(min_bets, required_count)
+            for bet_count in range(global_min, max_bets + 1):
+                selected = sorted(
+                    scoped,
+                    key=lambda x: (abs(x["odds"] - target_center), x["rank"], -x["score"])
+                )[:bet_count]
+                amounts = _calc_amounts(budget, len(selected), strategy)
+                remaining = [x for x in scoped if x not in selected]
+                remaining.sort(key=lambda x: x["odds"])
+
+                for _ in range(25):
+                    avg_odds = _calc_weighted_avg_odds([x["odds"] for x in selected], amounts)
+                    if avg_odds is None:
+                        break
+                    if target_low <= avg_odds <= target_high:
+                        break
+                    if avg_odds < target_low:
+                        selected.sort(key=lambda x: x["odds"])
+                        edge_item = selected[0]
+                        replacement = next((x for x in reversed(remaining) if x["odds"] > edge_item["odds"]), None)
+                    else:
+                        selected.sort(key=lambda x: x["odds"], reverse=True)
+                        edge_item = selected[0]
+                        replacement = next((x for x in remaining if x["odds"] < edge_item["odds"]), None)
+                    if replacement is None:
+                        break
+                    selected[0] = replacement
+                    remaining.remove(replacement)
+                    remaining.append(edge_item)
+
+                amounts = _calc_amounts(budget, len(selected), strategy)
+                avg_odds = _calc_weighted_avg_odds([x["odds"] for x in selected], amounts)
+                if avg_odds is None:
+                    continue
+                range_distance = _distance_to_range(avg_odds, target_low, target_high)
+                center_distance = abs(avg_odds - target_center)
+                quality_bonus = -sum(x["score"] for x in selected) / max(len(selected), 1) * 0.05
+                diversity = _calc_diversity_score(selected, ticket_type)
+                if strategy == "本命":
+                    count_penalty = abs(bet_count - desired_count) * 0.45
+                    diversity_penalty = (1.0 - diversity) * 0.8
+                    range_weight = 20
+                    center_weight = 2
+                elif strategy == "中穴":
+                    count_penalty = abs(bet_count - desired_count) * 0.70
+                    diversity_penalty = (1.0 - diversity) * 2.2
+                    range_weight = 12
+                    center_weight = 1.5
+                else:
+                    count_penalty = abs(bet_count - desired_count) * 0.90
+                    diversity_penalty = (1.0 - diversity) * 2.8
+                    range_weight = 10
+                    center_weight = 1.2
+                objective = (
+                    range_distance * range_weight
+                    + center_distance * center_weight
+                    + count_penalty
+                    + diversity_penalty
+                    + quality_bonus
+                )
+                global_packs.append(
+                    {
+                        "objective": objective,
+                        "selected": selected[:],
+                        "avg_odds": avg_odds,
+                        "drift": range_distance,
+                    }
+                )
+
+            if global_packs:
+                global_best = min(global_packs, key=lambda p: p["objective"])
+                if global_best["drift"] < chosen_drift:
+                    chosen = global_best
+
+        final_selected = chosen["selected"]
+
+    final_selected.sort(key=lambda x: (-x["score"], x["rank"], x["odds"]))
+    return [w["numbers"] for w in final_selected]
+
+
 def _calc_amounts(budget, num_bets, strategy):
     unit = 100
     if strategy == "本命":
@@ -128,6 +703,164 @@ def _calc_amounts(budget, num_bets, strategy):
     return amounts
 
 
+def _calc_amounts_with_odds(
+    budget: int,
+    strategy: str,
+    combo_odds: List[Optional[float]],
+    target_range: Tuple[float, float],
+) -> List[int]:
+    """
+    オッズ連動の金額配分。
+    - 目標合成オッズに近づくように低オッズ側へ厚めに配分
+    - 先頭1点への過集中を抑制（中穴/大穴は特に均し気味）
+    """
+    num_bets = len(combo_odds)
+    if num_bets == 0:
+        return []
+    unit = 100
+
+    # 大穴は低予算帯では均等100円配分を優先
+    if strategy == "大穴" and budget <= 10000:
+        amounts = [unit] * num_bets
+        total = unit * num_bets
+        if total < budget:
+            # 端数は先頭から100円ずつ加算（通常は total==budget）
+            i = 0
+            while total < budget:
+                amounts[i % num_bets] += unit
+                total += unit
+                i += 1
+        elif total > budget:
+            # 念のため過剰分を後ろから削る
+            i = num_bets - 1
+            while total > budget and i >= 0:
+                if amounts[i] > unit:
+                    amounts[i] -= unit
+                    total -= unit
+                i -= 1
+        return amounts
+
+    # 中穴の低〜中予算帯は広めに買いつつ、上位1〜2点を少し厚くする
+    if strategy == "中穴" and budget <= 2000:
+        amounts = [unit] * num_bets
+        extra_units = max(0, (budget - unit * num_bets) // unit)
+        if extra_units <= 0:
+            return amounts
+
+        ordered_idx = sorted(
+            range(num_bets),
+            key=lambda i: combo_odds[i] if combo_odds[i] is not None else 10**9
+        )
+        if budget <= 1000:
+            boost_slots = min(2, num_bets)
+            max_per_ticket = 300
+        elif budget <= 1500:
+            boost_slots = min(3, num_bets)
+            max_per_ticket = 300
+        else:
+            boost_slots = min(4, num_bets)
+            max_per_ticket = 300
+
+        slot_idx = 0
+        while extra_units > 0 and boost_slots > 0:
+            idx = ordered_idx[slot_idx % boost_slots]
+            if amounts[idx] + unit <= max_per_ticket:
+                amounts[idx] += unit
+                extra_units -= 1
+            slot_idx += 1
+            if slot_idx > 2000:
+                break
+
+        return amounts
+
+    # まずは従来配分を土台にする
+    base = _calc_amounts(budget, num_bets, strategy)
+
+    # オッズが取れない場合は従来配分
+    if not any(o is not None for o in combo_odds):
+        return base
+
+    low, high = target_range
+    target = (low + high) / 2.0
+
+    # 低オッズほど重くなる係数（目標から遠い高オッズは軽くする）
+    factors = []
+    for i, od in enumerate(combo_odds):
+        if od is None:
+            factors.append((i, 1.0))
+            continue
+        # target を超えるほど係数を落とす（下限 0.35）
+        ratio = target / max(od, 0.1)
+        factor = max(0.35, min(2.2, ratio))
+        factors.append((i, factor))
+
+    weighted = [max(unit, int((base[i] * f) / unit) * unit) for i, f in factors]
+    total = sum(weighted)
+    if total <= 0:
+        return base
+
+    # 予算へ正規化
+    scale = budget / total
+    amounts = [max(unit, int((a * scale) / unit) * unit) for a in weighted]
+
+    # 予算差分を低オッズ順に埋める
+    diff = budget - sum(amounts)
+    order = sorted(
+        range(num_bets),
+        key=lambda i: combo_odds[i] if combo_odds[i] is not None else 10**9
+    )
+    ptr = 0
+    while diff >= unit and order:
+        amounts[order[ptr % len(order)]] += unit
+        diff -= unit
+        ptr += 1
+
+    # 一点集中抑制（中穴/大穴は 40%、本命は 60% を上限目安）
+    cap_ratio = 0.60 if strategy == "本命" else 0.40
+    cap = max(unit, int((budget * cap_ratio) / unit) * unit)
+    for _ in range(20):
+        max_idx = max(range(num_bets), key=lambda i: amounts[i])
+        if amounts[max_idx] <= cap:
+            break
+        excess = amounts[max_idx] - cap
+        move = max(unit, (excess // unit) * unit)
+        amounts[max_idx] -= move
+        # 低オッズ側へ再配分
+        for i in order:
+            if i == max_idx:
+                continue
+            add = min(move, unit * 2)
+            amounts[i] += add
+            move -= add
+            if move <= 0:
+                break
+        if move > 0:
+            amounts[max_idx] += move
+            break
+
+    # 合計誤差の最終調整
+    total = sum(amounts)
+    if total < budget and order:
+        i = 0
+        while total < budget:
+            amounts[order[i % len(order)]] += unit
+            total += unit
+            i += 1
+    elif total > budget:
+        desc = sorted(range(num_bets), key=lambda i: amounts[i], reverse=True)
+        i = 0
+        while total > budget and desc:
+            idx = desc[i % len(desc)]
+            if amounts[idx] > unit:
+                amounts[idx] -= unit
+                total -= unit
+            i += 1
+            if i > 500:
+                break
+
+    return amounts
+
+
 def _make_reason(player_nums, ranked, strategy, idx):
     p_map = {p.car_number: p for p in ranked}
     main_num = player_nums[0]
@@ -137,18 +870,20 @@ def _make_reason(player_nums, ranked, strategy, idx):
 
     grade_label = {"SS": "SS級", "S1": "S1級", "S2": "S2級", "A1": "A1級", "A2": "A2級"}.get(main.grade, "")
     style_label = {"逃": "逃げ", "追": "追込み", "両": "自在型"}.get(main.style, main.style)
+    line_label = f"・{main.line_role}" if main.line_role != "不明" else ""
+    b_label = f"・B{main.back_count}" if main.back_count > 0 else ""
 
     if strategy == "本命":
         reasons = [
-            f"{main_num}号車({main.name})は{grade_label}・{style_label}。競走得点{main.score:.1f}で安定感あり",
-            f"3連対率{main.triple_rate:.1%}の{main_num}号車({main.name})が中心の堅い組み合わせ",
-            f"勝率{main.win_rate:.1%}の{main_num}号車({main.name})を軸に押さえの1点",
+            f"{main_num}号車({main.name})は{grade_label}・{style_label}{line_label}{b_label}。競走得点{main.score:.1f}で安定感あり",
+            f"3連対率{main.triple_rate:.1%}とB{main.back_count}を評価し、{main_num}号車({main.name})中心で構成",
+            f"勝率{main.win_rate:.1%}の{main_num}号車({main.name})を軸に、並び適性も加味した1点",
         ]
     elif strategy == "中穴":
         reasons = [
-            f"{main_num}号車({main.name})の{style_label}が炸裂すると中穴配当が期待できる",
-            f"ライン崩れが起きた際に{main_num}号車({main.name})が台頭する可能性",
-            f"{grade_label}の{main_num}号車({main.name})がコース適性を発揮できれば好走",
+            f"{main_num}号車({main.name})の{style_label}{line_label}とオッズ帯のバランスから中穴期待",
+            f"ライン崩れ時の伸びとB{main.back_count}を加味し、{main_num}号車({main.name})を評価",
+            f"{grade_label}の{main_num}号車({main.name})を、勝率/3連対率/戦法内訳の重みで選抜",
             f"前団争い激化で{main_num}号車({main.name})の差し込みに期待",
             f"展開次第で{main_num}号車({main.name})がチャンスを掴む",
         ]
@@ -186,16 +921,31 @@ def _make_advice(ranked, strategy):
 
 def generate_recommendation(race_info: RaceInfo, strategy: str, budget: int, ticket_type: str) -> RaceRecommendation:
     ranked = _rank_players(race_info.players, strategy)
-    num_bets = STRATEGIES[strategy]["num_bets"]
-    combos = _generate_combinations(ranked, strategy, ticket_type, num_bets)
-    amounts = _calc_amounts(budget, len(combos), strategy)
+    # まずはオッズ順位ベースで買い目を抽出し、不足分はスコアベースで補完する。
+    combos = _select_combos_from_odds(race_info, strategy, ticket_type, budget)
+    if not combos:
+        target_max = min(
+            STRATEGIES[strategy].get("max_bets", 12),
+            max(1, budget // 100),
+        )
+        fallback = _generate_combinations(ranked, strategy, ticket_type, target_max)
+        combos = fallback[:target_max]
+
+    target_range = STRATEGIES[strategy].get("target_portfolio_odds", (3.0, 5.0))
+    combo_odds = []
+    for nums in combos:
+        odds_key = tuple(nums) if ticket_type == "三連単" else tuple(sorted(nums))
+        combo_odds.append(race_info.odds_map.get(ticket_type, {}).get(odds_key))
+    amounts = _calc_amounts_with_odds(budget, strategy, combo_odds, target_range)
 
     bets = []
     for i, nums in enumerate(combos):
         stars = max(1, 3 - i) if strategy == "本命" else (3 if i == 0 else (2 if i <= 2 else 1))
         reason = _make_reason(nums, ranked, strategy, i)
         amount = amounts[i] if i < len(amounts) else amounts[-1]
-        bets.append(BetRecommendation(numbers=nums, amount=amount, stars=stars, reason=reason))
+        odds_key = tuple(nums) if ticket_type == "三連単" else tuple(sorted(nums))
+        odds = race_info.odds_map.get(ticket_type, {}).get(odds_key)
+        bets.append(BetRecommendation(numbers=nums, amount=amount, stars=stars, reason=reason, current_odds=odds))
 
     return RaceRecommendation(
         venue=race_info.venue,
@@ -208,4 +958,10 @@ def generate_recommendation(race_info: RaceInfo, strategy: str, budget: int, tic
         total_amount=sum(b.amount for b in bets),
         is_mock=race_info.is_mock,
         source_url=race_info.source_url,
+        odds_fetched_at=(
+            race_info.odds_fetched_at.strftime("%Y-%m-%d %H:%M:%S")
+            if race_info.odds_fetched_at else None
+        ),
+        ticket_odds_count=len(race_info.odds_map.get(ticket_type, {})),
+        matched_odds_count=sum(1 for b in bets if b.current_odds is not None),
     )

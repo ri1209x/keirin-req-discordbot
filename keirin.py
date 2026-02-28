@@ -25,9 +25,19 @@ async def _safe_send_message(
     ephemeral: bool = False,
 ):
     try:
+        # /keirin は先に defer するため、基本は followup で返す。
+        # 状態不整合で 40060 が返る場合も followup にフォールバックする。
         if interaction.response.is_done():
             return await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
         return await interaction.response.send_message(content=content, embed=embed, ephemeral=ephemeral)
+    except discord.HTTPException as e:
+        if e.code == 40060:  # Interaction has already been acknowledged
+            try:
+                return await interaction.followup.send(content=content, embed=embed, ephemeral=ephemeral)
+            except Exception:
+                logger.warning("Interaction 二重応答エラー後の followup 送信にも失敗しました")
+                return None
+        raise
     except discord.NotFound:
         logger.warning("Interaction が無効になったためメッセージ送信できませんでした")
         return None
@@ -128,7 +138,8 @@ class KeirinCog(commands.Cog, name="競輪"):
             logger.info(
                 f"[keirin] user={interaction.user} venue={matched_venue} "
                 f"race={race} strategy={strategy} budget={budget} "
-                f"ticket={ticket_type} date={target_date} data={data_type}"
+                f"ticket={ticket_type} date={target_date} data={data_type} "
+                f"odds={rec.ticket_odds_count} matched={rec.matched_odds_count}/{len(rec.bets)}"
             )
 
         except Exception as e:
