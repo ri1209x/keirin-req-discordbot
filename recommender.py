@@ -486,6 +486,27 @@ def _filter_candidates_by_strategy(
                 if len(result) >= required_count:
                     break
 
+        # さらに不足する場合は rank帯を外して 100〜300 倍から補完（100円広げ買いを優先）
+        if len(result) < required_count:
+            broad_main_pool = [
+                x for x in capped
+                if odds_min <= x["odds"] <= odds_max and x not in result
+            ]
+            broad_main_pool.sort(key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
+            for x in broad_main_pool:
+                result.append(x)
+                if len(result) >= required_count:
+                    break
+
+        # なお不足時のみ、50〜100（ブリッジ帯）を最後の補完として使用
+        if len(result) < required_count:
+            bridge_fallback = [x for x in capped if 50.0 < x["odds"] <= 100.0 and x not in result]
+            bridge_fallback.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
+            for x in bridge_fallback:
+                result.append(x)
+                if len(result) >= required_count:
+                    break
+
         if result:
             return result
 
