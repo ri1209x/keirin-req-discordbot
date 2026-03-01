@@ -26,7 +26,7 @@ STRATEGIES = {
     "中穴": {
         "description": "オッズ帯と選手能力のバランスで中穴帯を狙う",
         "min_bets": 5,
-        "max_bets": 18,
+        "max_bets": 24,
         "top_n": 5,
         "confidence": "中",
         "expected_odds": "20〜50倍",
@@ -138,6 +138,17 @@ def _calc_weighted_avg_odds(odds_list: List[float], amounts: List[int]) -> Optio
     if total_amount <= 0:
         return None
     return sum(od * am for od, am in usable) / total_amount
+
+
+def _calc_synthetic_odds(avg_odds: Optional[float], bet_count: int) -> Optional[float]:
+    """
+    合成オッズを簡易近似で算出。
+    三連単のような多点買いでは、同一予算に対して点数が増えるほど
+    実効リターンが薄まるため、平均オッズを点数で割って評価する。
+    """
+    if avg_odds is None or bet_count <= 0:
+        return None
+    return avg_odds / bet_count
 
 
 def _safe_norm(val: float, min_v: float, max_v: float) -> float:
@@ -301,8 +312,14 @@ def _get_budget_target_count(strategy: str, budget: int, min_bets: int, max_bets
             base = 10
         elif budget <= 2000:
             base = 13
+        elif budget <= 3000:
+            base = 14
+        elif budget <= 5000:
+            base = 16
+        elif budget <= 8000:
+            base = 19
         else:
-            base = max(10, budget // 180)
+            base = 22
     else:
         # 大穴は低予算帯では100円刻みで広く買う方針
         if budget <= 10000:
@@ -319,7 +336,11 @@ def _get_middle_count_window(budget: int) -> Tuple[int, int]:
         return 9, 12
     if budget <= 2000:
         return 12, 15
-    return 10, 18
+    if budget <= 5000:
+        return 12, 16
+    if budget <= 8000:
+        return 14, 20
+    return 16, 24
 
 
 def _calc_diversity_score(selected: List[dict], ticket_type: str) -> float:
@@ -429,6 +450,13 @@ def _filter_candidates_by_strategy(
             for x in bridge[:need_bridge]:
                 must.append(x)
             merged = must + [x for x in strict if x not in must]
+            if required_count > 0 and len(merged) < required_count:
+                remain = [x for x in scored if rank_min <= x["rank"] <= rank_max and x not in merged]
+                remain.sort(key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
+                for x in remain:
+                    merged.append(x)
+                    if len(merged) >= required_count:
+                        break
             if required_count > 0:
                 return merged[:required_count]
             return merged
@@ -633,6 +661,7 @@ def _select_combos_from_odds(
         min_bets = max_bets
 
     target_low, target_high = config.get("target_portfolio_odds", (3.0, 5.0))
+    synth_low, synth_high = (3.0, 5.0)
     target_center = (target_low + target_high) / 2.0
 
     candidates_packs = []
@@ -702,8 +731,13 @@ def _select_combos_from_odds(
         avg_odds = _calc_weighted_avg_odds([x["odds"] for x in selected], amounts)
         if avg_odds is None:
             continue
+        synthetic_odds = _calc_synthetic_odds(avg_odds, len(selected))
         range_distance = _distance_to_range(avg_odds, target_low, target_high)
         center_distance = abs(avg_odds - target_center)
+        synth_distance = (
+            _distance_to_range(synthetic_odds, synth_low, synth_high)
+            if synthetic_odds is not None else 0.0
+        )
         # 合成オッズ・点数・分散のバランスで評価
         quality_bonus = -sum(x["score"] for x in selected) / max(len(selected), 1) * 0.05
         diversity = _calc_diversity_score(selected, ticket_type)
@@ -713,20 +747,24 @@ def _select_combos_from_odds(
             diversity_penalty = (1.0 - diversity) * 0.8
             range_weight = 20
             center_weight = 2
+            synth_weight = 10
         elif strategy == "中穴":
             count_penalty = abs(bet_count - desired_count) * 0.70
             diversity_penalty = (1.0 - diversity) * 2.2
             range_weight = 12
             center_weight = 1.5
+            synth_weight = 12
         else:
             count_penalty = abs(bet_count - desired_count) * 0.90
             diversity_penalty = (1.0 - diversity) * 2.8
             range_weight = 10
             center_weight = 1.2
+            synth_weight = 10
 
         objective = (
             range_distance * range_weight
             + center_distance * center_weight
+            + synth_distance * synth_weight
             + count_penalty
             + diversity_penalty
             + quality_bonus
@@ -784,8 +822,13 @@ def _select_combos_from_odds(
                 avg_odds = _calc_weighted_avg_odds([x["odds"] for x in selected], amounts)
                 if avg_odds is None:
                     continue
+                synthetic_odds = _calc_synthetic_odds(avg_odds, len(selected))
                 range_distance = _distance_to_range(avg_odds, target_low, target_high)
                 center_distance = abs(avg_odds - target_center)
+                synth_distance = (
+                    _distance_to_range(synthetic_odds, synth_low, synth_high)
+                    if synthetic_odds is not None else 0.0
+                )
                 quality_bonus = -sum(x["score"] for x in selected) / max(len(selected), 1) * 0.05
                 diversity = _calc_diversity_score(selected, ticket_type)
                 if strategy == "本命":
@@ -793,19 +836,23 @@ def _select_combos_from_odds(
                     diversity_penalty = (1.0 - diversity) * 0.8
                     range_weight = 20
                     center_weight = 2
+                    synth_weight = 10
                 elif strategy == "中穴":
                     count_penalty = abs(bet_count - desired_count) * 0.70
                     diversity_penalty = (1.0 - diversity) * 2.2
                     range_weight = 12
                     center_weight = 1.5
+                    synth_weight = 12
                 else:
                     count_penalty = abs(bet_count - desired_count) * 0.90
                     diversity_penalty = (1.0 - diversity) * 2.8
                     range_weight = 10
                     center_weight = 1.2
+                    synth_weight = 10
                 objective = (
                     range_distance * range_weight
                     + center_distance * center_weight
+                    + synth_distance * synth_weight
                     + count_penalty
                     + diversity_penalty
                     + quality_bonus
@@ -960,8 +1007,13 @@ def _calc_amounts_with_odds(
         diff -= unit
         ptr += 1
 
-    # 一点集中抑制（中穴/大穴は 40%、本命は 60% を上限目安）
-    cap_ratio = 0.60 if strategy == "本命" else 0.40
+    # 一点集中抑制（本命は厚張り許容、中穴はやや分散、大穴は分散優先）
+    if strategy == "本命":
+        cap_ratio = 0.60
+    elif strategy == "中穴":
+        cap_ratio = 0.25
+    else:
+        cap_ratio = 0.40
     cap = max(unit, int((budget * cap_ratio) / unit) * unit)
     for _ in range(20):
         max_idx = max(range(num_bets), key=lambda i: amounts[i])
