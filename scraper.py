@@ -15,6 +15,7 @@ import random
 import hashlib
 import logging
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 
@@ -24,6 +25,7 @@ import requests
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger("keirin_bot.scraper")
+JST = ZoneInfo("Asia/Tokyo")
 
 PREFECTURES = [
     "北海道",
@@ -365,7 +367,7 @@ def fetch_race_card(venue: str, race_number: int, target_date: Optional[date] = 
     取得失敗時はモックデータを返す（Botが止まらないように）
     """
     if target_date is None:
-        target_date = date.today()
+        target_date = datetime.now(JST).date()
 
     venue_info = VENUE_MAP.get(venue)
     if not venue_info:
@@ -425,7 +427,7 @@ def _scrape_race_card(venue: str, race_number: int, target_date: date, url: str)
 
         players = _parse_players(soup)
         odds_map = _extract_odds_map(soup)
-        odds_fetched_at = datetime.now()
+        odds_fetched_at = datetime.now(JST)
         if not players:
             logger.warning(f"選手データ取得失敗 ({url}) → モックデータ使用")
             if _allow_mock():

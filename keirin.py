@@ -4,6 +4,7 @@
 import asyncio
 import logging
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -15,6 +16,7 @@ from google_ai_service import get_ai_advice
 from formatter import build_recommendation_embed, build_help_embed, build_venues_embed
 
 logger = logging.getLogger("keirin_bot.cog")
+JST = ZoneInfo("Asia/Tokyo")
 
 
 async def _safe_send_message(
@@ -103,7 +105,7 @@ class KeirinCog(commands.Cog, name="競輪"):
             errors.append("❌ 投票予算は100円以上で入力してください。")
 
         # 開催日パース
-        target_date = date.today()
+        target_date = datetime.now(JST).date()
         if race_date:
             try:
                 target_date = datetime.strptime(race_date, "%Y-%m-%d").date()
