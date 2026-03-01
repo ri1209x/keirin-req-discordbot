@@ -1,4 +1,5 @@
 discord.py==2.3.2
+audioop-lts>=0.2.1; python_version >= "3.13"
 python-dotenv==1.0.0
 google-generativeai>=0.8.0
 requests>=2.31.0
