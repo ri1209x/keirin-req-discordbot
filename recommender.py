@@ -20,8 +20,8 @@ STRATEGIES = {
         "rank_range": (1, 5),
         "odds_range": (3.0, 10.0),
         "target_portfolio_odds": (3.0, 10.0),
-        # 直近過去レースの簡易バックテストで調整（odds偏重を少し緩め、戦法を増やす）
-        "weights": {"odds": 0.40, "form": 0.30, "line": 0.15, "tactic": 0.15},
+        # オッズ依存を抑え、競走得点/B本数/決まり手/ラインを重視
+        "weights": {"odds": 0.10, "form": 0.50, "line": 0.22, "tactic": 0.18},
     },
     "中穴": {
         "description": "オッズ帯と選手能力のバランスで中穴帯を狙う",
@@ -33,7 +33,7 @@ STRATEGIES = {
         "rank_range": (6, 40),
         "odds_range": (20.0, 50.0),
         "target_portfolio_odds": (20.0, 50.0),
-        "weights": {"odds": 0.40, "form": 0.30, "line": 0.15, "tactic": 0.15},
+        "weights": {"odds": 0.08, "form": 0.52, "line": 0.22, "tactic": 0.18},
     },
     "大穴": {
         "description": "高配当帯の中で展開要素を重視して選抜",
@@ -45,7 +45,7 @@ STRATEGIES = {
         "rank_range": (41, 120),
         "odds_range": (100.0, 300.0),
         "target_portfolio_odds": (100.0, 300.0),
-        "weights": {"odds": 0.38, "form": 0.22, "line": 0.20, "tactic": 0.20},
+        "weights": {"odds": 0.07, "form": 0.48, "line": 0.25, "tactic": 0.20},
     },
 }
 
@@ -165,6 +165,172 @@ def _distance_to_range(value: float, low: float, high: float) -> float:
     return value - high
 
 
+def _parse_recent_results_stats(recent_results: str) -> Tuple[float, float]:
+    """
+    直近成績文字列（例: 1-3-2-1-5）から、
+    - 平均着順の良さ（0-1, 高いほど良い）
+    - 3着内率（0-1）
+    を返す。
+    """
+    if not recent_results:
+        return 0.5, 0.5
+    nums: List[int] = []
+    for t in recent_results.replace(" ", "").split("-"):
+        if not t:
+            continue
+        if t.isdigit():
+            v = int(t)
+            if 1 <= v <= 9:
+                nums.append(v)
+    if not nums:
+        return 0.5, 0.5
+    avg_rank = sum(nums) / len(nums)
+    rank_score = max(0.0, min(1.0, (10.0 - avg_rank) / 9.0))
+    top3_rate = sum(1 for n in nums if n <= 3) / len(nums)
+    return rank_score, top3_rate
+
+
+def _pearson_corr(xs: List[float], ys: List[float]) -> float:
+    n = min(len(xs), len(ys))
+    if n < 2:
+        return 0.0
+    mx = sum(xs[:n]) / n
+    my = sum(ys[:n]) / n
+    num = 0.0
+    dx2 = 0.0
+    dy2 = 0.0
+    for i in range(n):
+        dx = xs[i] - mx
+        dy = ys[i] - my
+        num += dx * dy
+        dx2 += dx * dx
+        dy2 += dy * dy
+    if dx2 <= 1e-12 or dy2 <= 1e-12:
+        return 0.0
+    return num / ((dx2 ** 0.5) * (dy2 ** 0.5))
+
+
+def _learn_feature_weights(players: List[Player]) -> Dict[str, float]:
+    """
+    出走表に含まれる過去指標（直近成績/勝率/3連対率）に対して、
+    説明力が高くなるよう score/B/決まり手/ライン の重みを簡易学習する。
+    """
+    if not players:
+        return {"score": 0.35, "back": 0.20, "kimarite": 0.25, "line": 0.20}
+
+    score_min, score_max = min(p.score for p in players), max(p.score for p in players)
+    back_min, back_max = min(p.back_count for p in players), max(p.back_count for p in players)
+    win_min, win_max = min(p.win_rate for p in players), max(p.win_rate for p in players)
+    tri_min, tri_max = min(p.triple_rate for p in players), max(p.triple_rate for p in players)
+
+    role_val = {"先頭": 1.0, "番手": 0.9, "短期": 0.75, "不明": 0.6}
+    features = []
+    targets = []
+    for p in players:
+        attack = p.escape_count + p.makuri_count
+        finish = p.sashi_count + p.mark_count
+        total = attack + finish
+        kimarite = (attack / total) * 0.55 + (finish / total) * 0.45 if total > 0 else 0.5
+
+        f_score = _safe_norm(p.score, score_min, score_max)
+        f_back = _safe_norm(float(p.back_count), float(back_min), float(back_max))
+        f_kimarite = max(0.0, min(1.0, kimarite))
+        f_line = role_val.get(p.line_role, role_val["不明"])
+        features.append((f_score, f_back, f_kimarite, f_line))
+
+        recent_rank_score, recent_top3 = _parse_recent_results_stats(p.recent_results)
+        win_norm = _safe_norm(p.win_rate, win_min, win_max)
+        tri_norm = _safe_norm(p.triple_rate, tri_min, tri_max)
+        # 過去実績ターゲット（直近成績をやや重視）
+        y = recent_rank_score * 0.35 + recent_top3 * 0.25 + tri_norm * 0.25 + win_norm * 0.15
+        targets.append(y)
+
+    best = {"score": 0.35, "back": 0.20, "kimarite": 0.25, "line": 0.20}
+    best_obj = -10.0
+    # 離散探索（学習データが少ない前提で過学習しにくいよう粗め）
+    steps = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
+    for ws in steps:
+        for wb in steps:
+            for wk in steps:
+                wl = 1.0 - (ws + wb + wk)
+                if wl < 0.10 or wl > 0.45:
+                    continue
+                preds = [
+                    f[0] * ws + f[1] * wb + f[2] * wk + f[3] * wl
+                    for f in features
+                ]
+                corr = _pearson_corr(preds, targets)
+                # 競走得点/決まり手/ライン優先の事前制約を軽く加える
+                prior = 0.08 * ws + 0.06 * wk + 0.05 * wl - 0.02 * wb
+                obj = corr + prior
+                if obj > best_obj:
+                    best_obj = obj
+                    best = {"score": ws, "back": wb, "kimarite": wk, "line": wl}
+    return best
+
+
+def _learn_strategy_weights(players: List[Player], strategy: str) -> Dict[str, float]:
+    """
+    レース単位で戦略重みを再学習する。
+    直近成績やライン情報が十分なときは、odds重みを下げて能力系を強める。
+    """
+    base = dict(STRATEGIES[strategy]["weights"])
+    if not players:
+        return base
+
+    known_roles = sum(1 for p in players if p.line_role != "不明")
+    role_ratio = known_roles / max(1, len(players))
+    lead_cnt = sum(1 for p in players if p.line_role == "先頭")
+    follow_cnt = sum(1 for p in players if p.line_role == "番手")
+    line_signal = min(1.0, (min(lead_cnt, follow_cnt) / 3.0))
+
+    recent_scores = []
+    top3_rates = []
+    for p in players:
+        r_score, r_top3 = _parse_recent_results_stats(p.recent_results)
+        recent_scores.append(r_score)
+        top3_rates.append(r_top3)
+    recent_signal = (sum(recent_scores) / len(recent_scores) + sum(top3_rates) / len(top3_rates)) / 2.0 if recent_scores else 0.5
+
+    # 能力系信号が強いほど odds を下げる
+    data_conf = role_ratio * 0.45 + line_signal * 0.35 + recent_signal * 0.20
+
+    odds_scale = max(0.25, 0.95 - data_conf * 0.65)
+    form_scale = 1.00 + data_conf * 0.35
+    line_scale = 1.00 + (role_ratio * 0.6 + line_signal * 0.4) * 0.45
+    tactic_scale = 1.00 + data_conf * 0.20
+
+    learned = {
+        "odds": base["odds"] * odds_scale,
+        "form": base["form"] * form_scale,
+        "line": base["line"] * line_scale,
+        "tactic": base["tactic"] * tactic_scale,
+    }
+
+    # 本命/中穴は同一ライン重視をさらに上乗せ
+    if strategy in ("本命", "中穴"):
+        learned["line"] *= 1.08
+    # 大穴は筋違い（別線）評価のため tactic も少し増やす
+    if strategy == "大穴":
+        learned["tactic"] *= 1.10
+
+    total = sum(learned.values())
+    if total <= 0:
+        return base
+    learned = {k: v / total for k, v in learned.items()}
+    # odds重みの上限を厳しめに固定
+    odds_cap = 0.10 if strategy == "本命" else 0.08
+    if learned["odds"] > odds_cap:
+        excess = learned["odds"] - odds_cap
+        learned["odds"] = odds_cap
+        redistribute_keys = ["form", "line", "tactic"]
+        rsum = sum(learned[k] for k in redistribute_keys)
+        if rsum > 0:
+            for k in redistribute_keys:
+                learned[k] += excess * (learned[k] / rsum)
+    return learned
+
+
 def _sorted_odds_items(race_info: RaceInfo, ticket_type: str):
     odds_map = race_info.odds_map.get(ticket_type, {})
     items = sorted(odds_map.items(), key=lambda x: (x[1], x[0]))
@@ -261,22 +427,68 @@ def _build_player_feature_map(players: List[Player]) -> Dict[int, Dict[str, floa
     tri_min, tri_max = min(p.triple_rate for p in players), max(p.triple_rate for p in players)
     back_min, back_max = min(p.back_count for p in players), max(p.back_count for p in players)
 
-    role_value = {"先頭": 1.0, "番手": 0.85, "短期": 0.70, "不明": 0.55}
+    learned = _learn_feature_weights(players)
+
+    role_value = {"先頭": 1.0, "番手": 0.90, "短期": 0.75, "不明": 0.60}
     style_value = {"逃": 1.0, "両": 0.85, "追": 0.70}
 
     feature_map: Dict[int, Dict[str, float]] = {}
+    player_map = {p.car_number: p for p in players}
+
+    # 同一ライン推定:
+    # - 先頭は自車番をラインID
+    # - 番手は「同地区 + 先頭の推進力 + 番手の追込み適性」で最も相性が高い先頭へ接続
+    leaders = [p for p in players if p.line_role == "先頭"]
+    line_id_map: Dict[int, int] = {}
+    for p in leaders:
+        line_id_map[p.car_number] = p.car_number
+
+    if leaders:
+        for p in players:
+            if p.line_role != "番手":
+                continue
+            best_leader = leaders[0]
+            best_score = -1.0
+            for ld in leaders:
+                same_pref_bonus = 0.25 if p.prefecture and p.prefecture == ld.prefecture else 0.0
+                ld_power = p.score * 0.0 + ld.score * 0.55 + ld.back_count * 0.20 + (ld.escape_count + ld.makuri_count) * 0.25
+                follower_fit = p.mark_count * 0.45 + p.sashi_count * 0.35 + p.triple_rate * 10.0 * 0.20
+                score = same_pref_bonus + ld_power * 0.01 + follower_fit * 0.01
+                if score > best_score:
+                    best_score = score
+                    best_leader = ld
+            line_id_map[p.car_number] = best_leader.car_number
+
+    for p in players:
+        if p.car_number not in line_id_map:
+            # 短期/不明は独立ライン扱い
+            line_id_map[p.car_number] = p.car_number
     for p in players:
         attack_count = p.escape_count + p.makuri_count
         finish_count = p.sashi_count + p.mark_count
         move_total = attack_count + finish_count
         attack_ratio = (attack_count / move_total) if move_total > 0 else (0.55 if p.style in ("逃", "両") else 0.35)
         finish_ratio = (finish_count / move_total) if move_total > 0 else (0.45 if p.style in ("追", "両") else 0.35)
+        recent_rank_score, recent_top3 = _parse_recent_results_stats(p.recent_results)
+
+        score_norm = _safe_norm(p.score, score_min, score_max)
+        back_norm = _safe_norm(float(p.back_count), float(back_min), float(back_max))
+        kimarite_score = attack_ratio * 0.55 + finish_ratio * 0.45
+        line_score = role_value.get(p.line_role, role_value["不明"])
+
+        learned_power = (
+            score_norm * learned["score"]
+            + back_norm * learned["back"]
+            + kimarite_score * learned["kimarite"]
+            + line_score * learned["line"]
+        )
 
         form_score = (
-            _safe_norm(p.score, score_min, score_max) * 0.40
-            + _safe_norm(p.win_rate, win_min, win_max) * 0.20
-            + _safe_norm(p.triple_rate, tri_min, tri_max) * 0.25
-            + _safe_norm(float(p.back_count), float(back_min), float(back_max)) * 0.15
+            learned_power * 0.60
+            + _safe_norm(p.win_rate, win_min, win_max) * 0.10
+            + _safe_norm(p.triple_rate, tri_min, tri_max) * 0.12
+            + recent_rank_score * 0.10
+            + recent_top3 * 0.08
         )
 
         tactic_score = (
@@ -292,32 +504,108 @@ def _build_player_feature_map(players: List[Player]) -> Dict[int, Dict[str, floa
             "attack_ratio": attack_ratio,
             "finish_ratio": finish_ratio,
             "line_role": p.line_role,
+            "score_norm": score_norm,
+            "back_norm": back_norm,
+            "line_score": line_score,
+            # 先頭の推進力を番手評価へ伝播させるための指標
+            "leader_power": score_norm * 0.60 + back_norm * 0.25 + attack_ratio * 0.15,
+            "recent_rank_score": recent_rank_score,
+            "recent_top3": recent_top3,
+            "line_id": line_id_map.get(p.car_number, p.car_number),
         }
 
     return feature_map
 
 
-def _calc_line_component(combo: List[int], ticket_type: str, feature_map: Dict[int, Dict[str, float]]) -> float:
-    roles = [feature_map.get(n, {}).get("line_role", "不明") for n in combo]
+def _calc_line_component(
+    combo: List[int],
+    ticket_type: str,
+    strategy: str,
+    feature_map: Dict[int, Dict[str, float]],
+) -> float:
+    feats = [feature_map.get(n, {}) for n in combo]
+    roles = [f.get("line_role", "不明") for f in feats]
 
     if ticket_type == "三連単":
         first = roles[0] if len(roles) > 0 else "不明"
         second = roles[1] if len(roles) > 1 else "不明"
-        base = 0.45
+        first_f = feats[0] if len(feats) > 0 else {}
+        second_f = feats[1] if len(feats) > 1 else {}
+        third_f = feats[2] if len(feats) > 2 else {}
+        line_ids = [f.get("line_id", n) for f, n in zip(feats, combo)]
+        same_line_12 = len(line_ids) > 1 and line_ids[0] == line_ids[1]
+        distinct_lines = len(set(line_ids)) if line_ids else 0
+
+        base = 0.35
         if first == "先頭":
-            base += 0.25
+            base += 0.15
         if second == "番手":
-            base += 0.20
-        if "短期" in roles:
             base += 0.10
-        return min(1.0, base)
+        if "短期" in roles:
+            base += 0.05
+
+        # 先頭が強いほど番手の連対期待を引き上げる
+        leader_power = first_f.get("leader_power", first_f.get("form", 0.5))
+        second_form = second_f.get("form", 0.5)
+        third_form = third_f.get("form", 0.5)
+        synergy = 0.0
+
+        if first == "先頭" and second == "番手" and same_line_12:
+            synergy += 0.17 + leader_power * 0.22 + second_form * 0.10
+            # 同一ラインの先頭-番手が強いと3着も連れやすい
+            synergy += third_form * 0.05
+        elif first == "先頭" and second == "番手":
+            # 異ラインの先頭-番手は加点を抑制
+            synergy += 0.03 + leader_power * 0.05 + second_form * 0.03
+        elif first == "先頭":
+            synergy += 0.05 + leader_power * 0.10
+        elif second == "番手":
+            synergy += 0.04 + second_form * 0.06
+
+        # 戦略別のライン重み:
+        # 本命/中穴: 同一ライン(先頭-番手)を強く評価
+        # 大穴: 別線決着(筋違い)を評価
+        strategy_adj = 0.0
+        if strategy in ("本命", "中穴"):
+            if same_line_12 and first == "先頭" and second == "番手":
+                strategy_adj += 0.24
+            elif same_line_12:
+                strategy_adj += 0.08
+            else:
+                strategy_adj -= 0.10
+        else:
+            # 大穴は筋違い決着を加点、同線ワンツーは減点
+            if same_line_12 and first == "先頭" and second == "番手":
+                strategy_adj -= 0.10
+            if distinct_lines >= 2:
+                strategy_adj += 0.10
+            if distinct_lines == 3:
+                strategy_adj += 0.06
+
+        return min(1.0, max(0.0, base + synergy + strategy_adj))
 
     # 三連複は並び順がないため、先頭/番手の同居を評価
     has_lead = "先頭" in roles
     has_follow = "番手" in roles
     has_short = "短期" in roles
-    score = 0.45 + (0.25 if has_lead and has_follow else 0.0) + (0.10 if has_short else 0.0)
-    return min(1.0, score)
+    score = 0.40 + (0.15 if has_lead and has_follow else 0.0) + (0.05 if has_short else 0.0)
+    if has_lead:
+        lead_power = max((f.get("leader_power", f.get("form", 0.5)) for f in feats), default=0.5)
+        score += lead_power * 0.15
+    if has_follow:
+        follow_form = max((f.get("form", 0.5) for f, r in zip(feats, roles) if r == "番手"), default=0.5)
+        score += follow_form * 0.10
+    line_ids = [f.get("line_id", n) for f, n in zip(feats, combo)]
+    distinct_lines = len(set(line_ids)) if line_ids else 0
+    if strategy in ("本命", "中穴"):
+        if distinct_lines <= 2:
+            score += 0.08
+    else:
+        if distinct_lines >= 2:
+            score += 0.10
+        if distinct_lines == 3:
+            score += 0.05
+    return min(1.0, max(0.0, score))
 
 
 def _calc_tactic_component(combo: List[int], ticket_type: str, feature_map: Dict[int, Dict[str, float]]) -> float:
@@ -351,7 +639,8 @@ def _calc_odds_component(odds: float, rank: int, strategy: str) -> float:
     else:
         rank_fit = 1.0
 
-    return odds_closeness * 0.65 + rank_fit * 0.35
+    # オッズは補助情報として扱う（過度な最適化を避ける）
+    return odds_closeness * 0.55 + rank_fit * 0.45
 
 
 def _calc_combo_score(
@@ -361,11 +650,20 @@ def _calc_combo_score(
     strategy: str,
     ticket_type: str,
     feature_map: Dict[int, Dict[str, float]],
+    strategy_weights: Optional[Dict[str, float]] = None,
 ) -> float:
-    weights = STRATEGIES[strategy]["weights"]
+    weights = strategy_weights or STRATEGIES[strategy]["weights"]
     player_features = [feature_map.get(n, {"form": 0.5}) for n in combo]
-    form_component = sum(f.get("form", 0.5) for f in player_features) / len(player_features) if player_features else 0.5
-    line_component = _calc_line_component(combo, ticket_type, feature_map)
+    if player_features:
+        form_component = sum(f.get("form", 0.5) for f in player_features) / len(player_features)
+        recent_component = sum(
+            (f.get("recent_rank_score", 0.5) * 0.55 + f.get("recent_top3", 0.5) * 0.45)
+            for f in player_features
+        ) / len(player_features)
+        form_component = form_component * 0.85 + recent_component * 0.15
+    else:
+        form_component = 0.5
+    line_component = _calc_line_component(combo, ticket_type, strategy, feature_map)
     tactic_component = _calc_tactic_component(combo, ticket_type, feature_map)
     odds_component = _calc_odds_component(odds, rank, strategy)
     return (
@@ -742,6 +1040,105 @@ def _inject_bridge_tickets(
     return selected_new
 
 
+def _inject_same_line_axis_candidates(
+    scored: List[dict],
+    scoped: List[dict],
+    strategy: str,
+    feature_map: Dict[int, Dict[str, float]],
+) -> List[dict]:
+    """
+    本命/中穴では、同一ラインの先頭-番手軸を候補に差し込む。
+    オッズ帯フィルタで本線が抜け落ちるのを防ぐための補正。
+    """
+    if strategy not in ("本命", "中穴"):
+        return scoped
+
+    axis = []
+    for x in scored:
+        nums = x["numbers"]
+        if len(nums) < 2:
+            continue
+        f1 = feature_map.get(nums[0], {})
+        f2 = feature_map.get(nums[1], {})
+        if f1.get("line_role") != "先頭" or f2.get("line_role") != "番手":
+            continue
+        if f1.get("line_id") != f2.get("line_id"):
+            continue
+        axis.append(x)
+
+    if not axis:
+        return scoped
+
+    # 軸候補は少数精鋭で先頭側に配置
+    axis.sort(key=lambda x: (-x["score"], x["rank"], x["odds"]))
+    top_n = 3 if strategy == "本命" else 4
+    head = axis[:top_n]
+    merged = head + [x for x in scoped if x not in head]
+    return merged
+
+
+def _is_same_line_lead_follow(item: dict, feature_map: Dict[int, Dict[str, float]]) -> bool:
+    nums = item.get("numbers", [])
+    if len(nums) < 2:
+        return False
+    f1 = feature_map.get(nums[0], {})
+    f2 = feature_map.get(nums[1], {})
+    return (
+        f1.get("line_role") == "先頭"
+        and f2.get("line_role") == "番手"
+        and f1.get("line_id") == f2.get("line_id")
+    )
+
+
+def _inject_axis_and_crossline_constraints(
+    selected: List[dict],
+    scoped: List[dict],
+    strategy: str,
+    feature_map: Dict[int, Dict[str, float]],
+) -> List[dict]:
+    if not selected:
+        return selected
+
+    selected_new = selected[:]
+    if strategy in ("本命", "中穴"):
+        need_axis = 2 if strategy == "本命" else 1
+        axis_count = sum(1 for x in selected_new if _is_same_line_lead_follow(x, feature_map))
+        if axis_count < need_axis:
+            axis_pool = [x for x in scoped if _is_same_line_lead_follow(x, feature_map) and x not in selected_new]
+            axis_pool.sort(key=lambda x: (-x["score"], x["rank"], x["odds"]))
+            replace_idx = sorted(
+                range(len(selected_new)),
+                key=lambda i: (selected_new[i]["score"], selected_new[i]["odds"])
+            )
+            for cand in axis_pool:
+                if axis_count >= need_axis:
+                    break
+                target = next(
+                    (i for i in replace_idx if not _is_same_line_lead_follow(selected_new[i], feature_map)),
+                    None
+                )
+                if target is None:
+                    break
+                selected_new[target] = cand
+                axis_count += 1
+
+    if strategy == "大穴":
+        # 大穴は別線決着を重視。先頭-番手の同線ワンツーを抑える。
+        cross_pool = [
+            x for x in scoped
+            if not _is_same_line_lead_follow(x, feature_map) and x not in selected_new
+        ]
+        cross_pool.sort(key=lambda x: (-x["score"], x["rank"], x["odds"]))
+        for i in range(len(selected_new)):
+            if not _is_same_line_lead_follow(selected_new[i], feature_map):
+                continue
+            if not cross_pool:
+                break
+            selected_new[i] = cross_pool.pop(0)
+
+    return selected_new
+
+
 def _select_combos_from_odds(
     race_info: RaceInfo,
     strategy: str,
@@ -755,6 +1152,7 @@ def _select_combos_from_odds(
         return []
 
     feature_map = _build_player_feature_map(race_info.players)
+    learned_strategy_weights = _learn_strategy_weights(race_info.players, strategy)
     scored = []
     for item in candidates:
         combo = item["numbers"]
@@ -765,6 +1163,7 @@ def _select_combos_from_odds(
             strategy=strategy,
             ticket_type=ticket_type,
             feature_map=feature_map,
+            strategy_weights=learned_strategy_weights,
         )
         scored.append({**item, "score": score})
 
@@ -791,6 +1190,7 @@ def _select_combos_from_odds(
         allow_high_odds_extension=(strategy == "大穴" and chaos),
         bridge_owner=bridge_owner,
     )
+    scoped = _inject_same_line_axis_candidates(scored, scoped, strategy, feature_map)
 
     # scoped件数に合わせて点数上限を再計算
     min_bets = min(min_bets, len(scoped))
@@ -816,6 +1216,7 @@ def _select_combos_from_odds(
             key=lambda x: (abs(x["odds"] - target_center), x["rank"], -x["score"])
         )[:bet_count]
         selected = _inject_bridge_tickets(selected, scoped, strategy, bridge_owner)
+        selected = _inject_axis_and_crossline_constraints(selected, scoped, strategy, feature_map)
         amounts = _calc_amounts(budget, len(selected), strategy)
         remaining = [x for x in scoped if x not in selected]
         remaining.sort(key=lambda x: x["odds"])
@@ -909,6 +1310,7 @@ def _select_combos_from_odds(
                     key=lambda x: (abs(x["odds"] - target_center), x["rank"], -x["score"])
                 )[:bet_count]
                 selected = _inject_bridge_tickets(selected, scoped, strategy, bridge_owner)
+                selected = _inject_axis_and_crossline_constraints(selected, scoped, strategy, feature_map)
                 amounts = _calc_amounts(budget, len(selected), strategy)
                 remaining = [x for x in scoped if x not in selected]
                 remaining.sort(key=lambda x: x["odds"])
