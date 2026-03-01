@@ -365,16 +365,76 @@ def _estimate_race_chaos(players: List[Player]) -> bool:
     return chaos_score >= 2.0
 
 
+def _decide_bridge_owner(scored: List[dict], budget: int) -> str:
+    """
+    50〜100倍帯（ブリッジ帯）を中穴/大穴どちらに寄せるかを、
+    全体オッズ分布と必要点数の圧迫度で決定する。
+    """
+    c_mid = sum(1 for x in scored if 20.0 <= x["odds"] <= 50.0)
+    c_bridge = sum(1 for x in scored if 50.0 < x["odds"] <= 100.0)
+    c_long = sum(1 for x in scored if 100.0 < x["odds"] <= 300.0)
+    if c_bridge == 0:
+        return "none"
+
+    affordable = max(1, budget // 100)
+    mid_min = min(STRATEGIES["中穴"].get("min_bets", 5), affordable, len(scored))
+    mid_max = min(STRATEGIES["中穴"].get("max_bets", 18), affordable, len(scored))
+    long_min = min(STRATEGIES["大穴"].get("min_bets", 7), affordable, len(scored))
+    long_max = min(STRATEGIES["大穴"].get("max_bets", 100), affordable, len(scored))
+    if mid_max < mid_min:
+        mid_min = mid_max
+    if long_max < long_min:
+        long_min = long_max
+
+    req_mid = _get_budget_target_count("中穴", budget, mid_min, mid_max) if mid_max > 0 else 0
+    req_long = _get_budget_target_count("大穴", budget, long_min, long_max) if long_max > 0 else 0
+
+    mid_pressure = req_mid / max(c_mid, 1)
+    long_pressure = req_long / max(c_long, 1)
+
+    # 供給不足が強い方に 50〜100帯を割り当てる
+    return "大穴" if long_pressure > mid_pressure else "中穴"
+
+
 def _filter_candidates_by_strategy(
     scored: List[dict],
     strategy: str,
     required_count: int = 0,
     allow_high_odds_extension: bool = False,
+    bridge_owner: str = "none",
 ) -> List[dict]:
     cfg = STRATEGIES[strategy]
     rank_min, rank_max = cfg.get("rank_range", (1, 10**9))
     odds_min, odds_max = cfg.get("odds_range", (0.0, float("inf")))
     odds_center = (odds_min + odds_max) / 2.0
+
+    if strategy == "中穴" and bridge_owner == "中穴":
+        bridge = [
+            x for x in scored
+            if rank_min <= x["rank"] <= rank_max and 50.0 < x["odds"] <= 100.0
+        ]
+        bridge.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
+
+        strict = [
+            x for x in scored
+            if rank_min <= x["rank"] <= rank_max and (
+                odds_min <= x["odds"] <= odds_max
+                or (50.0 < x["odds"] <= 100.0)
+            )
+        ]
+
+        if strict:
+            must = []
+            need_bridge = min(2, len(bridge))
+            for x in bridge[:need_bridge]:
+                must.append(x)
+            merged = must + [x for x in strict if x not in must]
+            if required_count > 0:
+                return merged[:required_count]
+            return merged
+
+        if strict and (required_count <= 0 or len(strict) >= required_count):
+            return strict
 
     if strategy == "大穴":
         # 大穴でも 500倍超は常時除外
@@ -388,6 +448,22 @@ def _filter_candidates_by_strategy(
 
         # 基本は 100〜300 倍で構成
         result = strict[:]
+
+        # 50〜100帯を大穴側に割り当てる場合は、最低1〜2点を優先採用
+        if bridge_owner == "大穴":
+            bridge = [
+                x for x in capped
+                if 50.0 < x["odds"] <= 100.0
+            ]
+            bridge.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
+            need_bridge = min(2, len(bridge), required_count if required_count > 0 else 2)
+            must = []
+            for x in bridge[:need_bridge]:
+                if x not in must:
+                    must.append(x)
+            result = must + [x for x in result if x not in must]
+            if required_count > 0 and len(result) > required_count:
+                result = result[:required_count]
 
         # 荒れる判定時のみ 300〜500 倍を最大2点まで補充
         if allow_high_odds_extension and len(result) < required_count:
@@ -406,6 +482,27 @@ def _filter_candidates_by_strategy(
             rank_pool = [x for x in capped if rank_min <= x["rank"] <= rank_max and x not in result]
             rank_pool.sort(key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
             for x in rank_pool:
+                result.append(x)
+                if len(result) >= required_count:
+                    break
+
+        # さらに不足する場合は rank帯を外して 100〜300 倍から補完（100円広げ買いを優先）
+        if len(result) < required_count:
+            broad_main_pool = [
+                x for x in capped
+                if odds_min <= x["odds"] <= odds_max and x not in result
+            ]
+            broad_main_pool.sort(key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
+            for x in broad_main_pool:
+                result.append(x)
+                if len(result) >= required_count:
+                    break
+
+        # なお不足時のみ、50〜100（ブリッジ帯）を最後の補完として使用
+        if len(result) < required_count:
+            bridge_fallback = [x for x in capped if 50.0 < x["odds"] <= 100.0 and x not in result]
+            bridge_fallback.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
+            for x in bridge_fallback:
                 result.append(x)
                 if len(result) >= required_count:
                     break
@@ -458,6 +555,50 @@ def _filter_candidates_by_strategy(
     return scored
 
 
+def _inject_bridge_tickets(
+    selected: List[dict],
+    scoped: List[dict],
+    strategy: str,
+    bridge_owner: str,
+) -> List[dict]:
+    if bridge_owner != strategy or not selected:
+        return selected
+
+    bridge = [x for x in scoped if 50.0 < x["odds"] <= 100.0]
+    if not bridge:
+        return selected
+
+    need = min(2, len(bridge), len(selected))
+    have = [x for x in selected if 50.0 < x["odds"] <= 100.0]
+    if len(have) >= need:
+        return selected
+
+    selected_new = selected[:]
+    # 差し込む候補
+    add_pool = [x for x in bridge if x not in selected_new]
+    if not add_pool:
+        return selected
+    add_pool.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
+
+    # 置換対象は「スコアが低く、50〜100でもない」買い目を優先
+    replace_idx = sorted(
+        range(len(selected_new)),
+        key=lambda i: (selected_new[i]["score"], abs(selected_new[i]["odds"] - 75.0)),
+    )
+
+    deficit = need - len(have)
+    for cand in add_pool:
+        if deficit <= 0:
+            break
+        target = next((i for i in replace_idx if not (50.0 < selected_new[i]["odds"] <= 100.0)), None)
+        if target is None:
+            break
+        selected_new[target] = cand
+        deficit -= 1
+
+    return selected_new
+
+
 def _select_combos_from_odds(
     race_info: RaceInfo,
     strategy: str,
@@ -498,11 +639,13 @@ def _select_combos_from_odds(
     desired_count = _get_budget_target_count(strategy, budget, min_bets, max_bets)
     required_count = desired_count if strategy in ("中穴", "大穴") else min_bets
     chaos = _estimate_race_chaos(race_info.players)
+    bridge_owner = _decide_bridge_owner(scored, budget)
     scoped = _filter_candidates_by_strategy(
         scored,
         strategy,
         required_count=required_count,
         allow_high_odds_extension=(strategy == "大穴" and chaos),
+        bridge_owner=bridge_owner,
     )
 
     # scoped件数に合わせて点数上限を再計算
@@ -528,6 +671,7 @@ def _select_combos_from_odds(
             scoped,
             key=lambda x: (abs(x["odds"] - target_center), x["rank"], -x["score"])
         )[:bet_count]
+        selected = _inject_bridge_tickets(selected, scoped, strategy, bridge_owner)
         amounts = _calc_amounts(budget, len(selected), strategy)
         remaining = [x for x in scoped if x not in selected]
         remaining.sort(key=lambda x: x["odds"])
@@ -611,6 +755,7 @@ def _select_combos_from_odds(
                     scoped,
                     key=lambda x: (abs(x["odds"] - target_center), x["rank"], -x["score"])
                 )[:bet_count]
+                selected = _inject_bridge_tickets(selected, scoped, strategy, bridge_owner)
                 amounts = _calc_amounts(budget, len(selected), strategy)
                 remaining = [x for x in scoped if x not in selected]
                 remaining.sort(key=lambda x: x["odds"])
