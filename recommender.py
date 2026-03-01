@@ -467,6 +467,11 @@ def _filter_candidates_by_strategy(
     if strategy == "大穴":
         # 大穴でも 500倍超は常時除外
         capped = [x for x in scored if x["odds"] <= 500.0]
+        # 50〜100倍帯（ブリッジ帯）は大穴では入れ過ぎない
+        # 目安: 全体の25%まで（最低2点、最大6点）
+        bridge_cap = 2
+        if required_count > 0:
+            bridge_cap = max(2, min(6, required_count // 4))
         strict = [
             x for x in capped
             if rank_min <= x["rank"] <= rank_max and odds_min <= x["odds"] <= odds_max
@@ -484,7 +489,7 @@ def _filter_candidates_by_strategy(
                 if 50.0 < x["odds"] <= 100.0
             ]
             bridge.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
-            need_bridge = min(2, len(bridge), required_count if required_count > 0 else 2)
+            need_bridge = min(1, len(bridge), required_count if required_count > 0 else 1, bridge_cap)
             must = []
             for x in bridge[:need_bridge]:
                 if x not in must:
@@ -505,16 +510,7 @@ def _filter_candidates_by_strategy(
                 if x not in result:
                     result.append(x)
 
-        # なお不足する場合は rank帯内で 500倍以下を近傍順に補完
-        if len(result) < required_count:
-            rank_pool = [x for x in capped if rank_min <= x["rank"] <= rank_max and x not in result]
-            rank_pool.sort(key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
-            for x in rank_pool:
-                result.append(x)
-                if len(result) >= required_count:
-                    break
-
-        # さらに不足する場合は rank帯を外して 100〜300 倍から補完（100円広げ買いを優先）
+        # 不足時は rank帯を外しても 100〜300 倍を優先補完（大穴の主戦場）
         if len(result) < required_count:
             broad_main_pool = [
                 x for x in capped
@@ -526,14 +522,59 @@ def _filter_candidates_by_strategy(
                 if len(result) >= required_count:
                     break
 
-        # なお不足時のみ、50〜100（ブリッジ帯）を最後の補完として使用
+        # さらに不足する場合は rank帯内から補完（まず 100倍超を優先）
         if len(result) < required_count:
-            bridge_fallback = [x for x in capped if 50.0 < x["odds"] <= 100.0 and x not in result]
-            bridge_fallback.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
-            for x in bridge_fallback:
+            if allow_high_odds_extension:
+                rank_pool = [
+                    x for x in capped
+                    if rank_min <= x["rank"] <= rank_max and x not in result and x["odds"] > 100.0
+                ]
+            else:
+                rank_pool = [
+                    x for x in capped
+                    if rank_min <= x["rank"] <= rank_max and x not in result and 100.0 < x["odds"] <= 300.0
+                ]
+            rank_pool.sort(key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
+            for x in rank_pool:
                 result.append(x)
                 if len(result) >= required_count:
                     break
+
+        # なお不足時のみ、50〜100（ブリッジ帯）を最後の補完として使用
+        if len(result) < required_count:
+            current_bridge = sum(1 for x in result if 50.0 < x["odds"] <= 100.0)
+            bridge_fallback = [x for x in capped if 50.0 < x["odds"] <= 100.0 and x not in result]
+            bridge_fallback.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
+            for x in bridge_fallback:
+                if current_bridge >= bridge_cap:
+                    break
+                result.append(x)
+                current_bridge += 1
+                if len(result) >= required_count:
+                    break
+
+        # 最終ガード: 50〜100倍の比率を上限内に抑える
+        bridge_items = [x for x in result if 50.0 < x["odds"] <= 100.0]
+        if len(bridge_items) > bridge_cap:
+            keep_bridge = sorted(
+                bridge_items,
+                key=lambda x: (abs(x["odds"] - 95.0), x["rank"])
+            )[:bridge_cap]
+            non_bridge = [x for x in result if not (50.0 < x["odds"] <= 100.0)]
+            result = non_bridge + keep_bridge
+
+            if len(result) < required_count:
+                refill_pool = [
+                    x for x in capped
+                    if x not in result and x["odds"] > 100.0
+                ]
+                if not allow_high_odds_extension:
+                    refill_pool = [x for x in refill_pool if x["odds"] <= 300.0]
+                refill_pool.sort(key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
+                for x in refill_pool:
+                    result.append(x)
+                    if len(result) >= required_count:
+                        break
 
         if result:
             return result
