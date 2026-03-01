@@ -178,6 +178,80 @@ def _sorted_odds_items(race_info: RaceInfo, ticket_type: str):
     ]
 
 
+def _rebalance_longshot_low_budget_combos(
+    race_info: RaceInfo,
+    ticket_type: str,
+    combos: List[List[int]],
+    budget: int,
+) -> List[List[int]]:
+    """
+    大穴×低予算帯（<=1万円）は 100円刻みで広く買う前提を強制する。
+    - 目標点数: budget/100
+    - ボリュームゾーン: 100〜300倍
+    - 50〜100倍は上限（約25%）まで
+    """
+    target_count = max(1, budget // 100)
+    odds_map = race_info.odds_map.get(ticket_type, {})
+    if not odds_map:
+        return combos[:target_count]
+
+    def to_key(nums: List[int]) -> Tuple[int, int, int]:
+        return tuple(nums) if ticket_type == "三連単" else tuple(sorted(nums))
+
+    def key_to_nums(key: Tuple[int, int, int]) -> List[int]:
+        return list(key) if ticket_type == "三連単" else sorted(list(key))
+
+    bridge_cap = max(2, min(6, target_count // 4))
+
+    # 既存買い目をベースに、重複除去して保持
+    selected_keys: List[Tuple[int, int, int]] = []
+    seen = set()
+    for nums in combos:
+        k = to_key(nums)
+        if k in odds_map and k not in seen:
+            seen.add(k)
+            selected_keys.append(k)
+
+    # 50〜100帯が多すぎる場合は低オッズ側から削る
+    bridge_keys = [k for k in selected_keys if 50.0 < odds_map.get(k, 0.0) <= 100.0]
+    if len(bridge_keys) > bridge_cap:
+        removable = sorted(bridge_keys, key=lambda k: (odds_map.get(k, 0.0), k))
+        remove_n = len(bridge_keys) - bridge_cap
+        remove_set = set(removable[:remove_n])
+        selected_keys = [k for k in selected_keys if k not in remove_set]
+        seen = set(selected_keys)
+
+    def add_from(pool: List[Tuple[int, int, int]]) -> None:
+        for k in pool:
+            if len(selected_keys) >= target_count:
+                return
+            if k in seen:
+                continue
+            seen.add(k)
+            selected_keys.append(k)
+
+    items = _sorted_odds_items(race_info, ticket_type)
+    pool_100_300 = [tuple(x["numbers"]) for x in items if 100.0 < x["odds"] <= 300.0]
+    pool_300_500 = [tuple(x["numbers"]) for x in items if 300.0 < x["odds"] <= 500.0]
+    pool_50_100 = [tuple(x["numbers"]) for x in items if 50.0 < x["odds"] <= 100.0]
+    pool_under_500 = [tuple(x["numbers"]) for x in items if x["odds"] <= 500.0]
+
+    # まず 100〜300 を優先して目標点数まで埋める
+    add_from(pool_100_300)
+    # 不足時のみ 300〜500 を補完
+    add_from(pool_300_500)
+    # さらに不足時のみ 50〜100 を上限付きで補完
+    if len(selected_keys) < target_count:
+        current_bridge = sum(1 for k in selected_keys if 50.0 < odds_map.get(k, 0.0) <= 100.0)
+        bridge_room = max(0, bridge_cap - current_bridge)
+        if bridge_room > 0:
+            add_from(pool_50_100[:bridge_room])
+    # まだ不足する場合のみ <=500 全域から補完
+    add_from(pool_under_500)
+
+    return [key_to_nums(k) for k in selected_keys[:target_count]]
+
+
 def _build_player_feature_map(players: List[Player]) -> Dict[int, Dict[str, float]]:
     if not players:
         return {}
@@ -1168,6 +1242,10 @@ def generate_recommendation(race_info: RaceInfo, strategy: str, budget: int, tic
         )
         fallback = _generate_combinations(ranked, strategy, ticket_type, target_max)
         combos = fallback[:target_max]
+
+    # 大穴×低予算帯は 100円刻みの広げ買いを最優先
+    if strategy == "大穴" and budget <= 10000:
+        combos = _rebalance_longshot_low_budget_combos(race_info, ticket_type, combos, budget)
 
     target_range = STRATEGIES[strategy].get("target_portfolio_odds", (3.0, 5.0))
     combo_odds = []
