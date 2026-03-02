@@ -1460,15 +1460,23 @@ def _calc_amounts_with_odds(
             range(num_bets),
             key=lambda i: combo_odds[i] if combo_odds[i] is not None else 10**9
         )
+        max_per_ticket = 300
+
+        # 第1段: まず広く 200円化して、100/300 の二択化を避ける
+        first_wave_slots = min(num_bets, extra_units)
+        for i in range(first_wave_slots):
+            amounts[ordered_idx[i]] += unit
+            extra_units -= 1
+            if extra_units <= 0:
+                break
+
+        # 第2段: 余剰のみ上位へ追加し 300円化
         if budget <= 1000:
             boost_slots = min(2, num_bets)
-            max_per_ticket = 300
         elif budget <= 1500:
             boost_slots = min(3, num_bets)
-            max_per_ticket = 300
         else:
             boost_slots = min(4, num_bets)
-            max_per_ticket = 300
 
         slot_idx = 0
         while extra_units > 0 and boost_slots > 0:
