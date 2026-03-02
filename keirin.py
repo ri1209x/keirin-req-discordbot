@@ -14,6 +14,12 @@ from scraper import VENUES, VENUE_MAP, fetch_race_card
 from recommender import generate_recommendation, STRATEGIES, TICKET_TYPES
 from google_ai_service import get_ai_advice
 from formatter import build_recommendation_embed, build_help_embed, build_venues_embed
+from learning_service import (
+    init_storage,
+    log_race_snapshot,
+    maybe_retrain,
+    save_race_result,
+)
 
 logger = logging.getLogger("keirin_bot.cog")
 JST = ZoneInfo("Asia/Tokyo")
@@ -48,6 +54,7 @@ async def _safe_send_message(
 class KeirinCog(commands.Cog, name="競輪"):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
+        init_storage()
 
     @app_commands.command(name="keirin", description="🚴 競輪の買い目をレコメンドします（出走表データ取得）")
     @app_commands.describe(
@@ -136,6 +143,19 @@ class KeirinCog(commands.Cog, name="競輪"):
             embed = build_recommendation_embed(rec, ai_advice)
             await _safe_send_message(interaction, embed=embed)
 
+            # 5. 学習データ保存 + 条件付き再学習
+            try:
+                await asyncio.to_thread(log_race_snapshot, race_info, rec)
+                train_result = await asyncio.to_thread(maybe_retrain)
+                if train_result:
+                    logger.info(
+                        "[learn] 再学習完了 trained_at=%s samples=%s",
+                        train_result.get("trained_at"),
+                        train_result.get("sample_counts"),
+                    )
+            except Exception as le:
+                logger.warning("[learn] ログ保存/再学習に失敗: %s", le)
+
             data_type = "模擬データ" if race_info.is_mock else "実データ"
             logger.info(
                 f"[keirin] user={interaction.user} venue={matched_venue} "
@@ -159,6 +179,64 @@ class KeirinCog(commands.Cog, name="競輪"):
     @app_commands.command(name="keirin_help", description="📖 競輪Botの使い方を表示します")
     async def keirin_help(self, interaction: discord.Interaction):
         await interaction.response.send_message(embed=build_help_embed())
+
+    @app_commands.command(
+        name="keirin_result",
+        description="🏁 レース結果（三連単）を登録して学習データを更新します"
+    )
+    @app_commands.describe(
+        venue="競輪場名（例: 広島）",
+        race="レース番号（1〜12）",
+        race_date="開催日 YYYY-MM-DD",
+        result="着順（例: 1-2-3）",
+        ticket_type="車券種別（通常は三連単）",
+    )
+    @app_commands.choices(
+        ticket_type=[
+            app_commands.Choice(name="三連単", value="三連単"),
+            app_commands.Choice(name="三連複", value="三連複"),
+        ]
+    )
+    async def keirin_result(
+        self,
+        interaction: discord.Interaction,
+        venue: str,
+        race: int,
+        race_date: str,
+        result: str,
+        ticket_type: str = "三連単",
+    ):
+        if not (1 <= race <= 12):
+            await interaction.response.send_message("❌ レース番号は1〜12で入力してください。", ephemeral=True)
+            return
+        if venue not in VENUE_MAP:
+            await interaction.response.send_message("❌ 競輪場名が不正です。", ephemeral=True)
+            return
+        try:
+            datetime.strptime(race_date, "%Y-%m-%d")
+        except ValueError:
+            await interaction.response.send_message("❌ 日付は YYYY-MM-DD 形式で入力してください。", ephemeral=True)
+            return
+
+        parts = [p.strip() for p in result.split("-")]
+        if len(parts) != 3 or not all(p.isdigit() for p in parts):
+            await interaction.response.send_message("❌ 着順は `1-2-3` 形式で入力してください。", ephemeral=True)
+            return
+        combo = tuple(int(x) for x in parts)
+        if any(n < 1 or n > 9 for n in combo) or len(set(combo)) != 3:
+            await interaction.response.send_message("❌ 着順は1〜9の重複なし3車で入力してください。", ephemeral=True)
+            return
+
+        try:
+            await asyncio.to_thread(save_race_result, venue, race, race_date, ticket_type, combo)
+            train_result = await asyncio.to_thread(maybe_retrain)
+            msg = f"✅ 結果登録: {venue} {race}R {race_date} {ticket_type} {result}"
+            if train_result:
+                msg += f"\n📘 再学習完了: samples={train_result.get('sample_counts')}"
+            await interaction.response.send_message(msg, ephemeral=True)
+        except Exception as e:
+            logger.error("[keirin_result] エラー: %s", e, exc_info=True)
+            await interaction.response.send_message(f"⚠️ 結果登録に失敗しました: {e}", ephemeral=True)
 
 
 async def setup(bot: commands.Bot):

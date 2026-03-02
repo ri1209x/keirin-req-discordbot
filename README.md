@@ -5,9 +5,11 @@ Kドリームスの出走表データを取得し、Discordスラッシュコマ
 ## 概要
 
 - `/keirin` で競輪場・レース番号・戦略・予算を指定して買い目を生成
+- `/keirin_result` で実着順を登録して学習データ化
 - 出走表は Kドリームス (`keirin.kdreams.jp`) から取得
 - 実行時点のオッズを可能な範囲で取得して表示
 - データ取得失敗時はモックデータへフォールバック（環境変数で無効化可能）
+- Railway 単体で学習データ蓄積・再学習・推論反映まで完結
 
 ## 主な機能
 
@@ -61,9 +63,13 @@ KEIRIN_ALLOW_MOCK=1
 ### 環境変数
 
 - `DISCORD_TOKEN` (必須): Discord Bot のトークン
-- `GOOGLE_API_KEY` (任意): AIコメント生成用
+- `GOOGLE_AI_API_KEY` (任意): AIコメント生成用
 - `DISCORD_ENABLE_MESSAGE_CONTENT` (任意): 通常は `0` のままでOK
 - `KEIRIN_ALLOW_MOCK` (任意): `0` でモックフォールバックを無効化
+- `KEIRIN_DATA_DIR` (任意): 学習DB/重みJSONの保存先。Railwayでは `/data` 推奨
+- `LEARN_INTERVAL_MINUTES` (任意): 再学習間隔（分）。既定 `360`
+- `LEARN_LOOKBACK_DAYS` (任意): 学習に使う履歴日数。既定 `90`
+- `LEARN_MIN_SAMPLES` (任意): 戦略ごとの最小学習件数。既定 `20`
 
 ## 実行方法
 
@@ -90,6 +96,29 @@ Discordで以下を実行します。
 ```text
 /keirin venue:松戸 race:7 strategy:本命 budget:1000 ticket_type:三連複 race_date:2026-02-28
 ```
+
+結果登録（学習用）:
+
+```text
+/keirin_result venue:広島 race:2 race_date:2026-03-01 result:1-3-7 ticket_type:三連単
+```
+
+## Railwayで学習まで完結させる設定
+
+1. Railwayでこのリポジトリをデプロイし、`Start Command` を `python bot.py` に設定
+2. Volume を追加し、マウント先を `/data` に設定
+3. 環境変数を設定
+   - `DISCORD_TOKEN`
+   - `GOOGLE_AI_API_KEY` (任意)
+   - `KEIRIN_DATA_DIR=/data`
+   - `LEARN_INTERVAL_MINUTES=360`（例）
+   - `LEARN_LOOKBACK_DAYS=90`（例）
+   - `LEARN_MIN_SAMPLES=20`（例）
+4. Bot運用
+   - `/keirin` 実行ごとに出走表/オッズ/推奨を SQLite(`/data/keirin_learning.db`) へ保存
+   - 一定間隔で自動再学習し、`/data/learned_weights.json` を更新
+   - 推奨ロジックは学習済み重みを自動参照
+5. レース後に `/keirin_result` で実着順を登録すると、教師データとして優先利用
 
 ## オッズについて
 

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from scraper import RaceInfo, Player
+from learning_service import load_runtime_weights
 
 # ─── 定数 ────────────────────────────────────────────────────────────────────
 
@@ -328,6 +329,15 @@ def _learn_strategy_weights(players: List[Player], strategy: str) -> Dict[str, f
         if rsum > 0:
             for k in redistribute_keys:
                 learned[k] += excess * (learned[k] / rsum)
+    # 永続学習重み（Railway内ログから学習）をブレンド
+    runtime = load_runtime_weights().get(strategy)
+    if isinstance(runtime, dict):
+        merged = {}
+        for k in ("odds", "form", "line", "tactic"):
+            merged[k] = learned.get(k, 0.0) * 0.70 + float(runtime.get(k, learned.get(k, 0.0))) * 0.30
+        total2 = sum(merged.values())
+        if total2 > 0:
+            learned = {k: v / total2 for k, v in merged.items()}
     return learned
 
 
