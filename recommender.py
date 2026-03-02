@@ -836,20 +836,53 @@ def _filter_candidates_by_strategy(
         if strict and (required_count <= 0 or len(strict) >= required_count):
             return strict
 
+    if strategy == "中穴":
+        # bridge_owner 判定に関わらず、中穴には 50〜100 を一定数混ぜる
+        strict_mid = [
+            x for x in scored
+            if rank_min <= x["rank"] <= rank_max and odds_min <= x["odds"] <= odds_max
+        ]
+        bridge_mid = [
+            x for x in scored
+            if rank_min <= x["rank"] <= rank_max and 50.0 < x["odds"] <= 100.0
+        ]
+        if not bridge_mid:
+            bridge_mid = [x for x in scored if 50.0 < x["odds"] <= 100.0]
+        bridge_mid.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
+
+        if strict_mid and bridge_mid and required_count > 0:
+            min_bridge = max(1, min(3, required_count // 5))
+            must = bridge_mid[:min(min_bridge, len(bridge_mid))]
+            merged = must + [x for x in strict_mid if x not in must]
+            if len(merged) < required_count:
+                remain = [
+                    x for x in scored
+                    if rank_min <= x["rank"] <= rank_max and x not in merged
+                ]
+                remain.sort(key=lambda x: (abs(x["odds"] - odds_center), x["rank"]))
+                for x in remain:
+                    merged.append(x)
+                    if len(merged) >= required_count:
+                        break
+            return merged[:required_count]
+
     if strategy == "大穴":
         # 大穴でも 500倍超は常時除外
         capped = [x for x in scored if x["odds"] <= 500.0]
-        # 50〜100倍帯（ブリッジ帯）は大穴では入れ過ぎない
-        # 目安: 全体の25%まで（最低2点、最大6点）
+        # 50〜100倍帯（ブリッジ帯）は大穴でも一定数は拾いつつ、入れ過ぎは抑制
+        # 目安: 全体の33%まで（最低2点、最大8点）
         bridge_cap = 2
         if required_count > 0:
-            bridge_cap = max(2, min(6, required_count // 4))
+            bridge_cap = max(2, min(8, required_count // 3))
         strict = [
             x for x in capped
             if rank_min <= x["rank"] <= rank_max and odds_min <= x["odds"] <= odds_max
         ]
         if required_count <= 0:
             required_count = len(strict)
+        bridge_min = 1
+        if required_count > 0:
+            bridge_min = max(1, min(3, required_count // 10))
 
         # 基本は 100〜300 倍で構成
         result = strict[:]
@@ -948,6 +981,25 @@ def _filter_candidates_by_strategy(
                     if len(result) >= required_count:
                         break
 
+        # 大穴でも 50〜100 を最低限は確保（筋違い拾いのため）
+        bridge_items = [x for x in result if 50.0 < x["odds"] <= 100.0]
+        if len(bridge_items) < bridge_min:
+            bridge_force = [x for x in capped if 50.0 < x["odds"] <= 100.0 and x not in result]
+            bridge_force.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
+            replace_idx = sorted(
+                range(len(result)),
+                key=lambda i: (result[i]["score"], -result[i]["odds"])
+            )
+            deficit = bridge_min - len(bridge_items)
+            for cand in bridge_force:
+                if deficit <= 0:
+                    break
+                target = next((i for i in replace_idx if not (50.0 < result[i]["odds"] <= 100.0)), None)
+                if target is None:
+                    break
+                result[target] = cand
+                deficit -= 1
+
         if result:
             return result
 
@@ -1002,23 +1054,33 @@ def _inject_bridge_tickets(
     strategy: str,
     bridge_owner: str,
 ) -> List[dict]:
-    if bridge_owner != strategy or not selected:
+    if not selected:
         return selected
 
     bridge = [x for x in scoped if 50.0 < x["odds"] <= 100.0]
     if not bridge:
         return selected
 
-    need = min(2, len(bridge), len(selected))
+    def _bridge_quota(s: str, n: int) -> Tuple[int, int]:
+        if s == "中穴":
+            min_need = max(2, min(6, n // 4))
+            max_keep = max(min_need, min(8, max(3, n // 2)))
+            return min_need, max_keep
+        if s == "大穴":
+            min_need = max(1, min(4, n // 8))
+            max_keep = max(min_need, min(6, max(2, n // 3)))
+            return min_need, max_keep
+        return 0, n
+
+    need, max_keep = _bridge_quota(strategy, len(selected))
+    if bridge_owner == strategy:
+        need = min(max_keep, need + 1)
+
     have = [x for x in selected if 50.0 < x["odds"] <= 100.0]
-    if len(have) >= need:
-        return selected
 
     selected_new = selected[:]
     # 差し込む候補
     add_pool = [x for x in bridge if x not in selected_new]
-    if not add_pool:
-        return selected
     add_pool.sort(key=lambda x: (abs(x["odds"] - 75.0), x["rank"]))
 
     # 置換対象は「スコアが低く、50〜100でもない」買い目を優先
@@ -1027,7 +1089,7 @@ def _inject_bridge_tickets(
         key=lambda i: (selected_new[i]["score"], abs(selected_new[i]["odds"] - 75.0)),
     )
 
-    deficit = need - len(have)
+    deficit = max(0, need - len(have))
     for cand in add_pool:
         if deficit <= 0:
             break
@@ -1036,6 +1098,19 @@ def _inject_bridge_tickets(
             break
         selected_new[target] = cand
         deficit -= 1
+
+    # 入れ過ぎを抑制
+    current_bridge = [x for x in selected_new if 50.0 < x["odds"] <= 100.0]
+    if len(current_bridge) > max_keep:
+        non_bridge_pool = [x for x in scoped if not (50.0 < x["odds"] <= 100.0) and x not in selected_new]
+        non_bridge_pool.sort(key=lambda x: (-x["score"], x["rank"], x["odds"]))
+        for i in range(len(selected_new)):
+            if len(current_bridge) <= max_keep or not non_bridge_pool:
+                break
+            if not (50.0 < selected_new[i]["odds"] <= 100.0):
+                continue
+            selected_new[i] = non_bridge_pool.pop(0)
+            current_bridge = [x for x in selected_new if 50.0 < x["odds"] <= 100.0]
 
     return selected_new
 
@@ -1243,6 +1318,8 @@ def _select_combos_from_odds(
             remaining.remove(replacement)
             remaining.append(low_item)
 
+        # オッズ調整後にブリッジ帯比率を再補正
+        selected = _inject_bridge_tickets(selected, scoped, strategy, bridge_owner)
         amounts = _calc_amounts(budget, len(selected), strategy)
         avg_odds = _calc_weighted_avg_odds([x["odds"] for x in selected], amounts)
         if avg_odds is None:
@@ -1335,6 +1412,7 @@ def _select_combos_from_odds(
                     remaining.remove(replacement)
                     remaining.append(edge_item)
 
+                selected = _inject_bridge_tickets(selected, scoped, strategy, bridge_owner)
                 amounts = _calc_amounts(budget, len(selected), strategy)
                 avg_odds = _calc_weighted_avg_odds([x["odds"] for x in selected], amounts)
                 if avg_odds is None:
