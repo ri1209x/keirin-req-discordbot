@@ -50,7 +50,7 @@ VENUE_MAP: Dict[str, dict] = {
     "取手":  {"code": "06", "slug": "toride"},
     "宇都宮": {"code": "07", "slug": "utsunomiya"},
     "大宮":  {"code": "08", "slug": "omiya"},
-    "西武園": {"code": "09", "slug": "seibuyen"},
+    "西武園": {"code": "09", "slug": "seibuen"},
     "京王閣": {"code": "10", "slug": "keiokaku"},
     "立川":  {"code": "11", "slug": "tachikawa"},
     "松戸":  {"code": "12", "slug": "matsudo"},

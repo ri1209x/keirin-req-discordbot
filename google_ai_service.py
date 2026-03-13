@@ -12,6 +12,8 @@ from recommender import RaceRecommendation
 from scraper import RaceInfo
 
 logger = logging.getLogger("keirin_bot.google_ai")
+_invalid_api_key_logged = False
+_google_ai_disabled = False
 
 
 def _build_race_context(race_info: RaceInfo) -> str:
@@ -51,8 +53,21 @@ def _build_prompt(rec: RaceRecommendation, race_info: Optional[RaceInfo]) -> str
 アドバイスは「💡」で始めてください。免責事項は含めないでください。"""
 
 
+def _get_api_key() -> Optional[str]:
+    for env_name in ("GOOGLE_AI_API_KEY", "GOOGLE_API_KEY"):
+        value = (os.getenv(env_name) or "").strip()
+        if value:
+            return value
+    return None
+
+
 def get_ai_advice(rec: RaceRecommendation, race_info: Optional[RaceInfo] = None) -> str:
-    api_key = os.getenv("GOOGLE_AI_API_KEY")
+    global _invalid_api_key_logged, _google_ai_disabled
+
+    if _google_ai_disabled:
+        return rec.advice
+
+    api_key = _get_api_key()
     if not api_key:
         return rec.advice
     try:
@@ -67,5 +82,14 @@ def get_ai_advice(rec: RaceRecommendation, race_info: Optional[RaceInfo] = None)
         )
         return response.text
     except Exception as e:
+        message = str(e)
+        if "API_KEY_INVALID" in message or "API key not valid" in message:
+            if not _invalid_api_key_logged:
+                logger.warning(
+                    "Google AI API キーが無効です。`GOOGLE_AI_API_KEY` を確認してください。"
+                )
+                _invalid_api_key_logged = True
+            _google_ai_disabled = True
+            return rec.advice
         logger.warning(f"Google AI API エラー: {e}")
         return rec.advice

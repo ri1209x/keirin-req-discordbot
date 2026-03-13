@@ -55,7 +55,7 @@ pip install -r requirements.txt
 
 ```env
 DISCORD_TOKEN=your_discord_bot_token
-GOOGLE_API_KEY=your_google_api_key
+GOOGLE_AI_API_KEY=your_google_ai_api_key
 DISCORD_ENABLE_MESSAGE_CONTENT=0
 KEIRIN_ALLOW_MOCK=1
 ```
